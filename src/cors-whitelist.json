@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "CORS origin whitelist for resolver.attestto.com. Add new origins via PR.",
+  "allowedOrigins": [
+    "https://attestto.com",
+    "https://app.attestto.com",
+    "https://attestto.net",
+    "https://spec.attestto.com",
+    "https://resolver.attestto.com",
+    "http://localhost:5173",
+    "http://localhost:3333",
+    "http://localhost:8080"
+  ]
+}
