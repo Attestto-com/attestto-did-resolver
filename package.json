@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Attestto DID Resolver — unified driver for did:pki and did:sns",
+  "homepage": "https://attestto.org/standards",
   "type": "module",
   "main": "dist/server.js",
   "scripts": {
