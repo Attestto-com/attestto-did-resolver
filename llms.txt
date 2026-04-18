@@ -1,0 +1,74 @@
+# @attestto/did-resolver
+
+> Unified HTTP DID resolver service for did:pki and did:sns methods, conforming to the DIF Universal Resolver API.
+
+Part of the [Attestto Open](https://attestto.org) ecosystem.
+
+## What it does
+
+An HTTP service that resolves `did:pki` and `did:sns` identifiers to W3C DID Documents. Deployed on Fly.io at `resolver.attestto.com`. Conforms to the [DIF Universal Resolver HTTP API](https://github.com/decentralized-identity/universal-resolver).
+
+This is a deployable service (public repo), not a published npm package.
+
+## API endpoints
+
+```
+GET /1.0/identifiers/{did}    -- Resolve a DID to a W3C DID Resolution Result
+GET /1.0/identifiers          -- List all resolvable did:pki DIDs
+GET /1.0/properties            -- Driver metadata (DIF convention)
+GET /health                    -- Health check
+```
+
+## Supported methods
+
+- **did:pki** -- National PKI bridge. Maps X.509 CA hierarchies to DID Documents. Data from attestto-trust country manifests.
+- **did:sns** -- Solana Name Service. Resolves .sol domain names to DID Documents via Solana mainnet RPC.
+
+## Example
+
+```bash
+curl https://resolver.attestto.com/1.0/identifiers/did:pki:cr:raiz-nacional
+curl https://resolver.attestto.com/1.0/identifiers/did:sns:attestto
+```
+
+## Environment variables
+
+- `PORT` (default: 8080) -- HTTP port
+- `TRUST_STORE_PATH` (default: ./trust-store/countries) -- Path to attestto-trust country manifests
+- `SOLANA_RPC_URL` (default: Solana mainnet public) -- Custom Solana RPC endpoint
+- `LOG_LEVEL` (default: info) -- debug, info, warn, error
+
+## Source layout
+
+```
+src/
+  server.ts           -- HTTP server entry point (Node http module)
+  pki-resolver.ts     -- did:pki resolution (wraps @attestto/did-pki-resolver logic)
+  sns-resolver.ts     -- did:sns resolution (Solana Name Service via @solana/web3.js)
+  parser.ts           -- DID string parsing
+  normalize.ts        -- X.509 DN normalization
+  document.ts         -- DID Document builder
+  registry.ts         -- Trust registry loader
+  countries.ts        -- Country-specific PKI metadata
+  types.ts            -- TypeScript interfaces
+  cors-whitelist.json -- Allowed CORS origins
+```
+
+## Deployment
+
+Deploys to Fly.io via Docker. The image bundles the trust store and runs as non-root `node` user with health checks.
+
+```bash
+fly deploy
+```
+
+## Related packages
+
+- [`@attestto/did-pki-resolver`](https://github.com/Attestto-com/did-pki-resolver) -- The did:pki resolver library this service uses
+- [`attestto-trust`](https://github.com/Attestto-com/attestto-trust) -- PKI trust store (bundled in Docker image)
+- [`did-pki-spec`](https://github.com/Attestto-com/did-pki-spec) -- did:pki method specification
+- [`did-sns-spec`](https://github.com/Attestto-com/did-sns-spec) -- did:sns method specification
+
+## License
+
+Apache-2.0
