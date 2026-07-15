@@ -48,7 +48,7 @@ export interface VerificationMethod {
   id: string;
   type: string;
   controller: string;
-  publicKeyJwk: JsonWebKey & { x5t?: string };
+  publicKeyJwk: JsonWebKey & { 'x5t#S256'?: string };
 }
 
 /** W3C DID Document service endpoint */
@@ -65,7 +65,7 @@ export interface GenerationMeta {
   notAfter: string;
   serialNumber: string;
   fingerprint: string;
-  fingerprintAlgorithm: 'sha-256' | 'sha-1';
+  fingerprintAlgorithm: 'sha-256';
   status: 'active' | 'expired' | 'revoked';
 }
 

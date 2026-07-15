@@ -115,7 +115,10 @@ export function buildDidDocument(
       id: vmId,
       type: 'JsonWebKey2020',
       controller: did,
-      publicKeyJwk: { ...jwk, x5t: entry.cert.sha256 },
+      // RFC 7517 §4.9 / RFC 7515 §4.1.8: the SHA-256 certificate thumbprint is
+      // `x5t#S256`, base64url-encoded. Derived from the same DER as `fingerprint`
+      // below so the two representations always agree (see did:pki spec §5).
+      publicKeyJwk: { ...jwk, 'x5t#S256': Buffer.from(sha256Fingerprint, 'hex').toString('base64url') },
     });
 
     assertionMethods.push(vmId);
