@@ -34,6 +34,7 @@ const CA_CONFIG: Record<CrCa, CaConfig> = {
       `${BASE}/CA%20SINPE%20-%20PERSONA%20FISICA%20v2(3).crl`,
     ],
     caCertFiles: [
+      'CA SINPE - PERSONA FISICA v2 (2026).pem',
       'CA SINPE - PERSONA FISICA v2 (2023).pem',
       'CA SINPE - PERSONA FISICA v2.pem',
     ],
@@ -43,7 +44,10 @@ const CA_CONFIG: Record<CrCa, CaConfig> = {
       `${BASE}/CA%20SINPE%20-%20PERSONA%20JURIDICA%20v2(2).crl`,
       `${BASE}/CA%20SINPE%20-%20PERSONA%20JURIDICA%20v2(3).crl`,
     ],
-    caCertFiles: ['CA SINPE - PERSONA JURIDICA v2.pem'],
+    caCertFiles: [
+      'CA SINPE - PERSONA JURIDICA v2 (2026).pem',
+      'CA SINPE - PERSONA JURIDICA v2.pem',
+    ],
   },
 };
 
