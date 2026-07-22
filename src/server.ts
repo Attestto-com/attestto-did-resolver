@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 import { TrustRegistry } from './registry.js'
 import { DidPkiResolver } from './pki-resolver.js'
 import { DidSnsResolver } from './sns-resolver.js'
+import { CrlRevocationService } from './crl-revocation.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -37,6 +38,7 @@ try {
 }
 const pkiResolver = new DidPkiResolver(registry)
 const snsResolver = new DidSnsResolver()
+const crlRevocation = new CrlRevocationService(TRUST_STORE)
 
 const pkiDids = pkiResolver.listDids()
 log('info', `[did:pki] Loaded ${pkiDids.length} DIDs from trust store`)
@@ -78,6 +80,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
   const json = JSON.stringify(body, null, 2)
   res.writeHead(status, {
     'Content-Type': 'application/did+ld+json',
+    'Content-Length': Buffer.byteLength(json),
+  })
+  res.end(json)
+}
+
+/** Send a response with the standard application/json content type. */
+function sendPlainJson(res: ServerResponse, status: number, body: unknown) {
+  const json = JSON.stringify(body, null, 2)
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(json),
   })
   res.end(json)
@@ -144,6 +156,36 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         implementationUrl: 'https://github.com/Attestto-com/attestto-did-resolver',
       },
     })
+    return
+  }
+
+  // CRL-based revocation endpoint for CR Firma Digital (SINPE).
+  // GET /revocation/cr/:ca  where :ca ∈ { sinpe-persona-fisica, sinpe-persona-juridica }
+  const revocationMatch = url.pathname.match(/^\/revocation\/cr\/([a-z0-9-]+)$/)
+  if (revocationMatch && method === 'GET') {
+    const ca = revocationMatch[1]
+    if (!CrlRevocationService.isSupported(ca)) {
+      sendPlainJson(res, 404, {
+        error: 'Unsupported CA',
+        ca,
+        supported: ['sinpe-persona-fisica', 'sinpe-persona-juridica'],
+      })
+      return
+    }
+    try {
+      const result = await crlRevocation.getRevocation(ca)
+      log('info', 'Revocation served', {
+        ca,
+        revoked: result.revokedSerials.length,
+        signatureVerified: result.signatureVerified,
+        stale: result.stale,
+      })
+      sendPlainJson(res, 200, result)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      log('warn', 'Revocation upstream failure', { ca, error: message })
+      sendPlainJson(res, 502, { error: 'CRL fetch failed', ca, message })
+    }
     return
   }
 
