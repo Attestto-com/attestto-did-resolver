@@ -19,8 +19,47 @@ Conforms to the [DIF Universal Resolver HTTP API](https://github.com/decentraliz
 GET /1.0/identifiers/{did}    → W3C DID Resolution Result
 GET /1.0/identifiers          → List resolvable did:pki DIDs
 GET /1.0/properties            → Driver metadata (DIF convention)
+GET /revocation/cr/{ca}        → CR Firma Digital (SINPE) CRL revocation status (JSON, CORS)
 GET /health                    → Health check
 ```
+
+### Revocation endpoint (`GET /revocation/cr/{ca}`)
+
+Lets a browser (e.g. `verify.attestto.com`) learn the revocation status of Costa Rica
+CR Firma Digital (SINPE) certificates without fetching the CRL directly — the BCCR CRLs
+are plain HTTP with no CORS, so browsers are blocked by both mixed-content and CORS. The
+resolver fetches the CRLs server-side, verifies each CRL signature against the CA cert it
+already bundles in the trust store, caches the parsed result in memory, and serves it as
+CORS-enabled JSON.
+
+`{ca}` is one of `sinpe-persona-fisica` or `sinpe-persona-juridica`. Both current-era CRLs
+(`v2(2)` and `v2(3)`) are fetched and their revoked serials merged; the earliest
+`nextUpdate` is reported.
+
+**Privacy:** the endpoint takes no certificate serial. It returns the entire revoked list
+so the client checks locally and never reveals which certificate it is verifying.
+
+```bash
+curl https://resolver.attestto.com/revocation/cr/sinpe-persona-fisica
+```
+
+```json
+{
+  "ca": "sinpe-persona-fisica",
+  "issuer": "serialNumber=CPJ-4-000-004017, C=CR, O=BANCO CENTRAL DE COSTA RICA, ...",
+  "thisUpdate": "2026-07-21T11:40:06.000Z",
+  "nextUpdate": "2026-07-29T00:00:06.000Z",
+  "stale": false,
+  "signatureVerified": true,
+  "revokedSerials": ["14000f93bf...", "..."]
+}
+```
+
+`signatureVerified` is `true` only when every merged CRL verifies against a bundled CA
+cert. It is `false` if a CRL is signed by a CA generation not present in the trust store,
+or if an upstream CRL fetch fails (the data is still returned). On total upstream failure
+the endpoint returns `502 { "error", "ca", "message" }`. CRL parsing and signature
+verification use the built-in `node:crypto` library — no new dependencies.
 
 ### Example
 
