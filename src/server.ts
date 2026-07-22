@@ -180,6 +180,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         signatureVerified: result.signatureVerified,
         stale: result.stale,
       })
+      // Cache the (public, non-user-specific) list in the browser until the CRL's
+      // own nextUpdate, so clients do not re-download the full list on every check.
+      // Fall back to 1h when the CRL is stale or omits nextUpdate.
+      const maxAge =
+        result.nextUpdate && !result.stale
+          ? Math.max(60, Math.floor((new Date(result.nextUpdate).getTime() - Date.now()) / 1000))
+          : 3600
+      res.setHeader('Cache-Control', `public, max-age=${maxAge}`)
       sendPlainJson(res, 200, result)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
