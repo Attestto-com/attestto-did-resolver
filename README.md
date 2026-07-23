@@ -109,8 +109,21 @@ npm run dev
 |---|---|---|
 | `PORT` | `8080` | HTTP port |
 | `TRUST_STORE_PATH` | `./trust-store/countries` | Path to [attestto-trust](https://github.com/Attestto-com/attestto-trust) country manifests (for did:pki) |
+| `REFRESH_SECRET` | *(unset → `/admin/refresh` returns 503)* | Bearer token required by `POST /admin/refresh`. Set as a Fly secret; mirror the same value into the attestto-trust GitHub Actions secret `RESOLVER_REFRESH_SECRET`. |
+| `REFRESH_INTERVAL_MS` | `21600000` (6h) | Interval for the scheduled npm pull of `@attestto/trust`. |
+| `REFRESH_FLOOR_FRACTION` | `0.9` | A refresh is accepted only if its DID count is ≥ this fraction of the current count. |
+| `REFRESH_DEBOUNCE_MS` | `30000` | Coalesce refreshes triggered within this window. |
 | `SOLANA_RPC_URL` | Solana mainnet public | Custom Solana RPC endpoint (for did:sns) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
+
+### Auto-refresh
+
+The resolver loads the baked `trust-store/` snapshot at boot, then pulls the latest
+`@attestto/trust` from npm shortly after startup and every `REFRESH_INTERVAL_MS`. A merge to
+`main` in attestto-trust also triggers an immediate refresh via `POST /admin/refresh`
+(authenticated with `REFRESH_SECRET`, body `{"source":"main"}`). A fetch that fails or falls
+below the sanity floor leaves the current data untouched. `GET /health` reports the live
+`trust.source`, `trust.trustVersion`, `trust.didCount`, and `trust.lastRefreshAt`.
 
 ## Deploy
 
