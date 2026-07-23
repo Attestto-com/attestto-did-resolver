@@ -110,12 +110,19 @@ function normalizeString(input: string): string {
  * `idchar` set (ALPHA / DIGIT / "." / "-" / "_") is dropped, and repeated or
  * edge hyphens are collapsed/trimmed.
  *
- * E.g. "dell'interno" → "dellinterno", "(agente-electronico)" → "agente-electronico".
+ * E.g. "dell'interno" → "dellinterno", "(agente-electronico)" → "agente-electronico",
+ * "Ges. f." → "ges-f" (periods treated as word boundaries, not kept as idchars).
+ *
+ * Note: periods are intentionally excluded from the allowed set even though the
+ * DID spec idchar grammar permits them, because the resolver's segment validator
+ * (`SEGMENT_REGEX` in parser.ts) does not accept periods. Treating periods like
+ * any other punctuation (word-boundary → hyphen, then collapse) is safe and produces
+ * cleaner, more human-readable identifiers.
  */
 function slugify(value: string): string {
   return value
     .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/[^a-z0-9-]/g, '')
     .replace(/--+/g, '-')
     .replace(/^-|-$/g, '');
 }
