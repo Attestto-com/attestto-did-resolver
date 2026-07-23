@@ -13,7 +13,8 @@
     "test": "node --import tsx --test src/**/*.test.ts"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.98.0"
+    "@solana/web3.js": "^1.98.0",
+    "tar": "^7.4.3"
   },
   "devDependencies": {
     "tsx": "^4.19.0",
