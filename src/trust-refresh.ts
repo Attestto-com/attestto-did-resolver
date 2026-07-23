@@ -62,9 +62,11 @@ export class RefreshManager {
 
   refresh(source: 'npm' | 'main', reason: string): Promise<RefreshResult> {
     if (this.inFlight) return this.inFlight
-    const since = this.now() - this.lastAttemptAt
-    if (this.lastAttemptAt !== 0 && since < this.debounceMs) {
-      return Promise.resolve({ ok: false, source, reason: `debounced (${since}ms < ${this.debounceMs}ms)` })
+    if (source !== 'main') {
+      const since = this.now() - this.lastAttemptAt
+      if (this.lastAttemptAt !== 0 && since < this.debounceMs) {
+        return Promise.resolve({ ok: false, source, reason: `debounced (${since}ms < ${this.debounceMs}ms)` })
+      }
     }
     this.lastAttemptAt = this.now()
     this.inFlight = this.doRefresh(source, reason).finally(() => { this.inFlight = null })

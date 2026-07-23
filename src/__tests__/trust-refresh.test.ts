@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, cpSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TrustRegistry } from '../registry.js'
@@ -97,5 +97,43 @@ test('refresh debounces a second call inside the window', async () => {
   now = 1000 + 5000 // 5s later, inside 30s window
   const second = await mgr.refresh('npm', 'test')
   assert.equal(second.ok, false)
+  assert.match(second.reason, /debounc/)
+})
+
+// M-1: main refresh is NOT blocked by debounce, but npm IS
+test('main refresh bypasses debounce window after an npm refresh', async () => {
+  const baked = makeCountriesDir(['de', 'cr'])
+  const state = stateFrom(baked)
+  const fresh = makeCountriesDir(['de', 'cr', 'fr'])
+  let now = 1000
+  const mgr = new RefreshManager(state, {
+    fetchTrust: fetcherFrom(fresh, '2', 'main'),
+    debounceMs: 30000,
+    now: () => now,
+  })
+  // First refresh (npm) sets lastAttemptAt
+  const first = await mgr.refresh('npm', 'scheduled')
+  assert.equal(first.ok, true)
+  now = 1000 + 5000 // 5s later, inside debounce window
+  // main refresh must NOT be debounced
+  const webhook = await mgr.refresh('main', 'webhook')
+  assert.equal(webhook.ok, true, 'main refresh inside debounce window must succeed')
+})
+
+test('npm refresh within debounce window after npm refresh is still debounced', async () => {
+  const baked = makeCountriesDir(['de', 'cr'])
+  const state = stateFrom(baked)
+  const fresh = makeCountriesDir(['de', 'cr', 'fr'])
+  let now = 1000
+  const mgr = new RefreshManager(state, {
+    fetchTrust: fetcherFrom(fresh, '3', 'npm'),
+    debounceMs: 30000,
+    now: () => now,
+  })
+  const first = await mgr.refresh('npm', 'scheduled')
+  assert.equal(first.ok, true)
+  now = 1000 + 5000 // 5s later, inside debounce window
+  const second = await mgr.refresh('npm', 'scheduled')
+  assert.equal(second.ok, false, 'npm refresh inside debounce window must be debounced')
   assert.match(second.reason, /debounc/)
 })

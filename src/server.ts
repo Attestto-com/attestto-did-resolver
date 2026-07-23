@@ -25,6 +25,7 @@ import { DidSnsResolver } from './sns-resolver.js'
 import { CrlRevocationService } from './crl-revocation.js'
 import { RefreshManager, type TrustState } from './trust-refresh.js'
 import { checkBearer } from './admin-auth.js'
+import { readBodyCapped } from './http-utils.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -232,13 +233,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     let source: 'npm' | 'main' = 'npm'
     try {
-      const chunks: Buffer[] = []
-      for await (const c of req) chunks.push(c as Buffer)
-      if (chunks.length) {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
+      const raw = await readBodyCapped(req, 4096)
+      if (raw.length) {
+        const body = JSON.parse(raw.toString('utf-8'))
         if (body?.source === 'main' || body?.source === 'npm') source = body.source
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof RangeError) {
+        sendPlainJson(res, 413, { error: 'Payload too large' })
+        return
+      }
       // Empty or malformed body → default source 'npm'.
     }
     refreshManager.refresh(source, 'webhook')
