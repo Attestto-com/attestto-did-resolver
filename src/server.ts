@@ -23,6 +23,7 @@ import { TrustRegistry } from './registry.js'
 import { DidPkiResolver } from './pki-resolver.js'
 import { DidSnsResolver } from './sns-resolver.js'
 import { CrlRevocationService } from './crl-revocation.js'
+import { RefreshManager, type TrustState } from './trust-refresh.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -30,18 +31,33 @@ const TRUST_STORE = process.env.TRUST_STORE_PATH ?? join(dirname(fileURLToPath(i
 
 // ── Initialize resolvers ────────────────────────────────────────────
 
-const registry = new TrustRegistry(TRUST_STORE)
+// Cold start from the baked snapshot — the resolver is never empty even if
+// the first network refresh fails.
+const bakedRegistry = new TrustRegistry(TRUST_STORE)
 try {
-  registry.load()
+  bakedRegistry.load()
 } catch (err) {
-  console.warn(`[did:pki] Trust store not loaded: ${err instanceof Error ? err.message : err}`)
+  console.warn(`[did:pki] Baked trust store not loaded: ${err instanceof Error ? err.message : err}`)
 }
-const pkiResolver = new DidPkiResolver(registry)
+const bakedPki = new DidPkiResolver(bakedRegistry)
+const state: TrustState = {
+  registry: bakedRegistry,
+  pkiResolver: bakedPki,
+  crl: new CrlRevocationService(TRUST_STORE),
+  meta: { source: 'baked', version: 'baked', didCount: bakedPki.listDids().length, lastRefreshAt: null },
+  tempDir: null,
+}
 const snsResolver = new DidSnsResolver()
-const crlRevocation = new CrlRevocationService(TRUST_STORE)
 
-const pkiDids = pkiResolver.listDids()
-log('info', `[did:pki] Loaded ${pkiDids.length} DIDs from trust store`)
+const REFRESH_INTERVAL_MS = Number(process.env.REFRESH_INTERVAL_MS || 21_600_000) // 6h
+const REFRESH_FLOOR_FRACTION = Number(process.env.REFRESH_FLOOR_FRACTION || 0.9)
+const REFRESH_DEBOUNCE_MS = Number(process.env.REFRESH_DEBOUNCE_MS || 30_000)
+const refreshManager = new RefreshManager(state, {
+  floorFraction: REFRESH_FLOOR_FRACTION,
+  debounceMs: REFRESH_DEBOUNCE_MS,
+})
+
+log('info', `[did:pki] Cold start: ${state.meta.didCount} DIDs from baked snapshot`)
 log('info', `[did:sns] Solana RPC: ${process.env.SOLANA_RPC_URL || 'mainnet public (default)'}`)
 
 // ── CORS ────────────────────────────────────────────────────────────
@@ -120,7 +136,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       driver: 'attestto-did-resolver',
       version: '0.1.0',
       supportedMethods: ['pki', 'sns'],
-      pkiDids: pkiDids.length,
+      pkiDids: state.meta.didCount,
+      trust: {
+        source: state.meta.source,
+        trustVersion: state.meta.version,
+        didCount: state.meta.didCount,
+        lastRefreshAt: state.meta.lastRefreshAt,
+      },
     })
     return
   }
@@ -173,7 +195,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       return
     }
     try {
-      const result = await crlRevocation.getRevocation(ca)
+      const result = await state.crl.getRevocation(ca)
       log('info', 'Revocation served', {
         ca,
         revoked: result.revokedSerials.length,
@@ -208,7 +230,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     let result: any
 
     if (did.startsWith('did:pki:')) {
-      result = pkiResolver.resolve(did)
+      result = state.pkiResolver.resolve(did)
     } else if (did.startsWith('did:sns:')) {
       result = await snsResolver.resolve(did)
     } else {
@@ -242,7 +264,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
   // List resolvable did:pki DIDs
   if (url.pathname === '/1.0/identifiers' && method === 'GET') {
-    sendJson(res, 200, { pkiDids: pkiResolver.listDids() })
+    sendJson(res, 200, { pkiDids: state.pkiResolver.listDids() })
     return
   }
 
@@ -269,6 +291,18 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   log('info', `Attestto DID Resolver listening on port ${PORT}`, {
     methods: ['did:pki', 'did:sns'],
-    pkiDids: pkiDids.length,
+    pkiDids: state.meta.didCount,
   })
 })
+
+// Pull the latest published trust data shortly after boot (non-blocking), then
+// on a fixed interval. Failures are logged and leave the baked snapshot in place.
+refreshManager.refresh('npm', 'startup')
+  .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Startup refresh: ${r.reason}`, { didCount: r.didCount }))
+  .catch((err) => log('warn', `[did:pki] Startup refresh threw: ${err instanceof Error ? err.message : err}`))
+
+setInterval(() => {
+  refreshManager.refresh('npm', 'scheduled')
+    .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Scheduled refresh: ${r.reason}`, { didCount: r.didCount }))
+    .catch((err) => log('warn', `[did:pki] Scheduled refresh threw: ${err instanceof Error ? err.message : err}`))
+}, REFRESH_INTERVAL_MS).unref()
