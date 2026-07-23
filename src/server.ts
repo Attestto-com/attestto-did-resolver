@@ -24,10 +24,12 @@ import { DidPkiResolver } from './pki-resolver.js'
 import { DidSnsResolver } from './sns-resolver.js'
 import { CrlRevocationService } from './crl-revocation.js'
 import { RefreshManager, type TrustState } from './trust-refresh.js'
+import { checkBearer } from './admin-auth.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
 const TRUST_STORE = process.env.TRUST_STORE_PATH ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'trust-store', 'countries')
+const REFRESH_SECRET = process.env.REFRESH_SECRET
 
 // ── Initialize resolvers ────────────────────────────────────────────
 
@@ -216,6 +218,33 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       log('warn', 'Revocation upstream failure', { ca, error: message })
       sendPlainJson(res, 502, { error: 'CRL fetch failed', ca, message })
     }
+    return
+  }
+
+  // Authenticated manual/webhook refresh. POST /admin/refresh { "source": "npm" | "main" }
+  if (url.pathname === '/admin/refresh' && method === 'POST') {
+    const auth = checkBearer(req.headers.authorization, REFRESH_SECRET)
+    if (!auth.ok) {
+      sendPlainJson(res, auth.status, auth.status === 503
+        ? { error: 'Refresh endpoint disabled (REFRESH_SECRET not set)' }
+        : { error: 'Unauthorized' })
+      return
+    }
+    let source: 'npm' | 'main' = 'npm'
+    try {
+      const chunks: Buffer[] = []
+      for await (const c of req) chunks.push(c as Buffer)
+      if (chunks.length) {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'))
+        if (body?.source === 'main' || body?.source === 'npm') source = body.source
+      }
+    } catch {
+      // Empty or malformed body → default source 'npm'.
+    }
+    refreshManager.refresh(source, 'webhook')
+      .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Webhook refresh: ${r.reason}`, { didCount: r.didCount }))
+      .catch((err) => log('warn', `[did:pki] Webhook refresh threw: ${err instanceof Error ? err.message : err}`))
+    sendPlainJson(res, 202, { accepted: true, source })
     return
   }
 
