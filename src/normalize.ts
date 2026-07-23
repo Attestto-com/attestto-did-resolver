@@ -105,6 +105,22 @@ function normalizeString(input: string): string {
 }
 
 /**
+ * Convert an already-transliterated, lowercased value into a valid DID path
+ * segment. Whitespace becomes a hyphen, then every character outside the DID
+ * `idchar` set (ALPHA / DIGIT / "." / "-" / "_") is dropped, and repeated or
+ * edge hyphens are collapsed/trimmed.
+ *
+ * E.g. "dell'interno" → "dellinterno", "(agente-electronico)" → "agente-electronico".
+ */
+function slugify(value: string): string {
+  return value
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9._-]/g, '')
+    .replace(/--+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
  * Normalize an Organization (O) field value to a single path segment.
  * Strips corporate suffixes and applies known abbreviations.
  */
@@ -126,11 +142,8 @@ function normalizeOrg(org: string): string {
     }
   }
 
-  // kebab-case
-  return value
-    .replace(/\s+/g, '-')
-    .replace(/--+/g, '-')
-    .replace(/^-|-$/g, '');
+  // kebab-case + strip non-idchar punctuation
+  return slugify(value);
 }
 
 /**
@@ -233,16 +246,11 @@ function processCN(cn: string): string[] {
     segments = segments.flatMap(s => s.split(sep));
   }
 
-  // 9. Normalize each segment: whitespace → hyphen, clean up
+  // 9. Normalize each segment: whitespace → hyphen, strip non-idchar, clean up
   return segments
     .map(s => s.trim())
     .filter(s => s.length > 0)
-    .map(s =>
-      s
-        .replace(/\s+/g, '-')
-        .replace(/--+/g, '-')
-        .replace(/^-|-$/g, '')
-    )
+    .map(slugify)
     .filter(s => s.length > 0);
 }
 
@@ -286,7 +294,12 @@ export function derivePathSegments(
   // 3. Process cleaned CN → qualifier segments
   const cnSegments = processCN(cleanedCN);
 
-  // 4. Combine: org segment + CN segments
+  // 4. Combine: org segment + CN segments.
+  //    Guard against an org that slugified to empty (all non-idchar punctuation)
+  //    so we never emit an empty path segment.
+  if (!orgSegment) {
+    return cnSegments;
+  }
   if (cnSegments.length === 0) {
     return [orgSegment];
   }
