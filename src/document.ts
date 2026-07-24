@@ -1,4 +1,4 @@
-import { createHash, X509Certificate } from 'node:crypto';
+import { createHash, X509Certificate, type KeyObject } from 'node:crypto';
 import type {
   RegistryEntry,
   DidDocument,
@@ -11,11 +11,96 @@ import type {
 import { getCountryConfig } from './countries.js';
 
 /**
+ * Minimal DER TLV reader — returns the tag, the content offset, and the end
+ * offset of one ASN.1 element. Only definite-length encodings occur in SPKI.
+ */
+function readTLV(
+  buf: Buffer,
+  off: number,
+): { tag: number; contentOff: number; end: number } {
+  const tag = buf[off++];
+  let len = buf[off++];
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | buf[off++];
+  }
+  return { tag, contentOff: off, end: off + len };
+}
+
+const b64url = (b: Buffer): string => Buffer.from(b).toString('base64url');
+
+/**
+ * Build a JWK by hand from a SubjectPublicKeyInfo (SPKI) DER buffer.
+ *
+ * Node's native `KeyObject.export({ format: 'jwk' })` refuses two key classes
+ * that appear in real national PKIs (notably the German HBA/qCA CAs):
+ *   - RSA-PSS keys ("Unsupported JWK Key Type") — the key is ordinary RSA, only
+ *     the algorithm OID (id-RSASSA-PSS) differs, so we read n/e from the SPKI.
+ *   - EC keys on brainpool curves ("Unsupported JWK EC curve") — JWK has no
+ *     registered `crv` name, so we emit the OpenSSL curve name (e.g.
+ *     "brainpoolP256r1") and the raw x/y coordinates.
+ *
+ * SPKI = SEQ { SEQ { algOID, params }, BIT STRING subjectPublicKey }.
+ */
+function spkiToJwk(key: KeyObject): JsonWebKey {
+  const der = key.export({ type: 'spki', format: 'der' }) as Buffer;
+
+  // outer SEQUENCE → AlgorithmIdentifier SEQUENCE → BIT STRING
+  const outer = readTLV(der, 0);
+  const algId = readTLV(der, outer.contentOff);
+  const bitStr = readTLV(der, algId.end);
+  // BIT STRING content starts with an "unused bits" byte (always 0 here).
+  const spk = der.subarray(bitStr.contentOff + 1, bitStr.end);
+
+  const keyType = key.asymmetricKeyType;
+
+  if (keyType === 'rsa' || keyType === 'rsa-pss') {
+    // subjectPublicKey wraps RSAPublicKey ::= SEQ { modulus INTEGER, exponent INTEGER }
+    const rsaSeq = readTLV(spk, 0);
+    const nTlv = readTLV(spk, rsaSeq.contentOff);
+    let n = spk.subarray(nTlv.contentOff, nTlv.end);
+    const eTlv = readTLV(spk, nTlv.end);
+    const e = spk.subarray(eTlv.contentOff, eTlv.end);
+    // INTEGERs are signed → drop a leading 0x00 padding byte from the modulus.
+    if (n[0] === 0x00) n = n.subarray(1);
+    return { kty: 'RSA', n: b64url(n), e: b64url(e) };
+  }
+
+  if (keyType === 'ec') {
+    // subjectPublicKey = 0x04 || X || Y (uncompressed point).
+    const curve = key.asymmetricKeyDetails?.namedCurve;
+    if (!curve || spk[0] !== 0x04) {
+      throw new Error(`Unsupported EC public key encoding (curve: ${curve ?? 'unknown'})`);
+    }
+    const coord = spk.subarray(1);
+    const half = coord.length / 2;
+    return {
+      kty: 'EC',
+      crv: curve,
+      x: b64url(coord.subarray(0, half)),
+      y: b64url(coord.subarray(half)),
+    };
+  }
+
+  throw new Error(`Unsupported key type for JWK export: ${keyType}`);
+}
+
+/**
  * Extract a JWK public key from a PEM-encoded X.509 certificate.
+ *
+ * Uses Node's native JWK export for the common cases and falls back to a
+ * hand-rolled SPKI parse for RSA-PSS and brainpool-EC keys that Node refuses
+ * to export (see spkiToJwk).
  */
 function extractJwk(pem: string): JsonWebKey {
   const x509 = new X509Certificate(pem);
-  return x509.publicKey.export({ format: 'jwk' }) as JsonWebKey;
+  const key = x509.publicKey;
+  try {
+    return key.export({ format: 'jwk' }) as JsonWebKey;
+  } catch {
+    return spkiToJwk(key);
+  }
 }
 
 /**
