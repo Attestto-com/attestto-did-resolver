@@ -50,14 +50,16 @@ test('O with parentheses: parentheses are stripped, DID is valid', () => {
   assert.match(did, DID_PKI_RE);
 });
 
-test('CR MICITT country-authority still collapses (O omitted)', () => {
-  // O is a CR country authority → CN-only derivation (unchanged behavior).
+test('CR MICITT country-authority: O omitted, CN folds to ONE segment (ATT-1070)', () => {
+  // O is a CR country authority → CN-only derivation. Under the ATT-1070
+  // canonical slug rule the mid " - " folds into a single segment instead of
+  // splitting into a stray extra segment.
   const segments = derivePathSegments(
     'cr',
     'CA SINPE - PERSONA FISICA',
     'BANCO CENTRAL DE COSTA RICA',
   );
-  assert.deepEqual(segments, ['sinpe', 'persona-fisica']);
+  assert.deepEqual(segments, ['sinpe-persona-fisica']);
 });
 
 test('FNMT: accent/kebab + org-dedup behavior unchanged', () => {
