@@ -24,6 +24,12 @@ const SNS_PROGRAM_ID = new PublicKey('namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRk
 const SOL_TLD_PARENT = new PublicKey('58PwtjSDuFHuUkYjH9BYnnQKHfwo9reZhC2zMJv9JPkx')
 const HASH_PREFIX = 'SPL Name Service'
 
+/**
+ * The all-zero account — the Solana system program. §9.4 deactivates a DID by
+ * transferring the domain to it, which the SNS program cannot undo.
+ */
+const ZERO_ADDRESS = PublicKey.default.toBase58()
+
 const NETWORK_ENDPOINTS: Record<string, string> = {
   mainnet: 'https://api.mainnet-beta.solana.com',
   devnet: 'https://api.devnet.solana.com',
@@ -113,6 +119,14 @@ export interface DidResolutionMetadata {
   error?: string
   errorMessage?: string
   duration?: number
+  /**
+   * §9.2: the domain exists on-chain but carries no DID metadata, so whatever
+   * is returned was synthesised from the owner key alone. A verifier MUST treat
+   * this as an UNREGISTERED identity.
+   */
+  degraded?: boolean
+  /** Human-readable companion to `degraded`, and the only signal §9.5's suspension has. */
+  warning?: string
   snsMetadata?: Record<string, unknown>
 }
 
@@ -197,7 +211,33 @@ export class DidSnsResolver {
 
       const domainData = await this.fetchDomainData(name, network)
       if (!domainData) {
+        // Genuinely absent — no account at the derived PDA. Deliberately NOT
+        // degraded: that flag distinguishes "exists but unregistered" from
+        // "does not exist", and setting it on every notFound would erase the
+        // distinction §9.2 introduced it to preserve.
         return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
+      }
+
+      // ── §9.2 step 9: the zero owner, checked BEFORE the buffer ────────────
+      //
+      // "If owner is zero address → return deactivated." The ordering is not
+      // cosmetic: transferring the domain to the system program does not erase
+      // the data buffer, so a retired identity read in the other order still
+      // presents a live document whose #key-1 is the system program itself.
+      //
+      // No `error` member: §9.4's worked example carries only `contentType`,
+      // and `server.ts` derives its status from the presence of `error`, so an
+      // error code here would turn the documented HTTP 200 into a 500.
+      if (domainData.owner === ZERO_ADDRESS) {
+        return {
+          '@context': 'https://w3id.org/did-resolution/v1',
+          didDocument: null,
+          didResolutionMetadata: {
+            contentType: 'application/did+ld+json',
+            duration: this.deps.now() - startTime,
+          },
+          didDocumentMetadata: { deactivated: true },
+        }
       }
 
       // §9.1: "DID registration requires an on-chain write." §12: "DID
@@ -211,8 +251,22 @@ export class DidSnsResolver {
       // Model D warning exists to prevent a verifier from trusting.
       //
       // Registration is the write. There is no name that skips it.
+      //
+      // §9.2 permits either the owner-key fallback document or this
+      // `notFound`-adjacent empty result; we keep the empty one, since a
+      // populated-but-untrusted document is exactly the shape §9.1 says
+      // verifiers keep mistaking for a registered identity. What was missing is
+      // the second half of the sentence — "it MUST still set degraded: true so
+      // the distinction from a genuinely non-existent domain is preserved".
+      // Without it the flag §9.1 tells verifiers to gate on does not exist, and
+      // an unwritten domain is indistinguishable from an absent one.
       if (!domainData.didMetadata?.hasMetadata) {
-        return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
+        return this.errorResult('notFound', `No did:sns DID found for: ${did}`, {
+          degraded: true,
+          warning:
+            'unregistered did:sns — SNS domain exists but no DID metadata was written; ' +
+            'owner key only, no services / encryption / attestation',
+        })
       }
 
       // Step 4: Build DID Document
@@ -239,17 +293,41 @@ export class DidSnsResolver {
         }
       }
 
+      // ── §9.5: suspension is not deactivation ─────────────────────────────
+      //
+      // A cleared ACTIVE flag used to be reported as
+      // `didDocumentMetadata.deactivated = true`. §9.5 lists the two as
+      // separate lifecycle phases — suspension is "Active flag cleared … DID
+      // remains resolvable but non-functional" and has a documented Recovery
+      // phase; deactivation is the zero-owner transfer §9.4 marks IRREVERSIBLE.
+      // Claiming the permanent state for a compliance hold tells a consumer an
+      // identity is gone for good when it is expected back.
+      //
+      // The spec defines no machine-readable member for suspension — only
+      // `deactivated`, which is spoken for. Rather than invent one, the state
+      // goes in `warning`, the vocabulary §9.2 already uses for exactly this
+      // "a generic consumer must be able to see it" problem. SOC-177 asks the
+      // spec for a flag; until it names one, nothing here is fabricated.
+      const suspended = domainData.didMetadata.active === false
+
       return {
         '@context': 'https://w3id.org/did-resolution/v1',
         didDocument,
         didResolutionMetadata: {
           contentType: 'application/did+ld+json',
           duration,
+          ...(suspended
+            ? {
+                warning:
+                  'suspended did:sns — the on-chain ACTIVE flag is cleared; the DID resolves ' +
+                  'but MUST NOT be relied upon for authentication, credential verification or ' +
+                  'attestation validation until it is restored',
+              }
+            : {}),
           snsMetadata,
         },
         didDocumentMetadata: {
           versionId: domainData.owner,
-          ...(domainData.didMetadata?.active === false ? { deactivated: true } : {}),
         },
       }
     } catch (error) {
@@ -477,11 +555,15 @@ export class DidSnsResolver {
   /**
    * Build an error resolution result.
    */
-  private errorResult(error: string, errorMessage: string): DidResolutionResult {
+  private errorResult(
+    error: string,
+    errorMessage: string,
+    extra?: Pick<DidResolutionMetadata, 'degraded' | 'warning'>
+  ): DidResolutionResult {
     return {
       '@context': 'https://w3id.org/did-resolution/v1',
       didDocument: null,
-      didResolutionMetadata: { error, errorMessage },
+      didResolutionMetadata: { error, errorMessage, ...extra },
       didDocumentMetadata: {},
     }
   }
