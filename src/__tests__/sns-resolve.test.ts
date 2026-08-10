@@ -14,9 +14,17 @@ import assert from 'node:assert/strict'
 import { DidSnsResolver } from '../sns-resolver.js'
 
 /** A NameRegistry header: parent(32) ‖ owner(32) ‖ class(32), then the buffer. */
-function account(opts: { owner?: Buffer; data?: Buffer } = {}) {
-  const owner = opts.owner ?? Buffer.alloc(32, 7)
-  return Buffer.concat([Buffer.alloc(32), owner, Buffer.alloc(32), opts.data ?? Buffer.alloc(0)])
+function account(data?: Buffer, owner: Buffer = Buffer.alloc(32, 7)) {
+  return Buffer.concat([Buffer.alloc(32), owner, Buffer.alloc(32), data ?? Buffer.alloc(0)])
+}
+
+/** A v2 DID metadata buffer carrying the 0x44494401 magic — a REGISTERED DID. */
+function registeredMetadata() {
+  const buf = Buffer.alloc(160)
+  Buffer.from([0x44, 0x49, 0x44, 0x01]).copy(buf, 0)
+  buf[4] = 0x02 // schema version
+  buf[5] = 0x01 // ACTIVE
+  return buf
 }
 
 /** Records every address asked for, so the test can compare derivations. */
@@ -163,7 +171,11 @@ describe('DID Core — the document echoes the DID that was resolved', () => {
     // `did:sns` should define a canonical form that drops `.sol` is undecided
     // upstream (SOC-177 G7); until it is, echoing is the only choice that
     // invents nothing.
-    const { resolver } = resolverWith(account())
+    //
+    // Note the fixture carries DID metadata. It did not need to before SOC-172,
+    // because the name contains "attestto" and the substring bypass admitted it
+    // without an on-chain write — this test was quietly relying on the defect.
+    const { resolver } = resolverWith(account(registeredMetadata()))
     const out = await resolver.resolve('did:sns:alice.attestto.sol')
     assert.equal(out.didDocument?.id, 'did:sns:alice.attestto.sol')
   })

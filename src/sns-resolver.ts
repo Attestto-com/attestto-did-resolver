@@ -138,6 +138,15 @@ export interface SnsAccountReader {
 export interface DidSnsResolverDeps extends SnsAccountReader {
   /** Injected so `duration` is not wall-clock in tests. */
   now?: () => number
+  /**
+   * Service endpoints this deployment advertises for the DIDs it operates.
+   *
+   * Defaults to NONE. The spec is operator-agnostic (§1) and a driver that
+   * hardcodes one company's hostnames into every document is asserting a
+   * relationship the subject never entered into. An operator opts in; the
+   * published driver does not.
+   */
+  operatorServices?: (did: string, network: SnsNetwork) => ServiceEndpoint[]
 }
 
 // ── Resolver ─────────────────────────────────────────────────────────────────
@@ -150,6 +159,7 @@ export class DidSnsResolver {
     this.deps = {
       fetchAccount: deps?.fetchAccount ?? ((address, network) => this.readFromRpc(address, network)),
       now: deps?.now ?? (() => Date.now()),
+      operatorServices: deps?.operatorServices ?? (() => []),
     }
   }
 
@@ -190,9 +200,18 @@ export class DidSnsResolver {
         return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
       }
 
-      // Verify did:sns compliance — domain must have DID metadata or be an Attestto domain
-      const isAttesttoCompliant = domainData.didMetadata?.hasMetadata || name.includes('attestto')
-      if (!isAttesttoCompliant) {
+      // §9.1: "DID registration requires an on-chain write." §12: "DID
+      // registration is not implicit."
+      //
+      // This used to read `|| name.includes('attestto')`, accepting a SUBSTRING
+      // of the name as a substitute for the 0x44494401 write. `attesttofake`,
+      // `not-attestto-really` and `x.attestto-evil` all satisfied it, so anyone
+      // could register such a `.sol` name with an empty buffer and receive a
+      // resolver-blessed document — on the vendor's own brand, which §3.2's
+      // Model D warning exists to prevent a verifier from trusting.
+      //
+      // Registration is the write. There is no name that skips it.
+      if (!domainData.didMetadata?.hasMetadata) {
         return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
       }
 
@@ -403,72 +422,40 @@ export class DidSnsResolver {
       keyAgreement.push(`${did}#ecies-key`)
     }
 
-    const isAttestto = parsed.name.includes('attestto') || meta?.hasMetadata
-    const services: ServiceEndpoint[] = []
-
-    // LinkedDomains and platform service only for Attestto domains
-    if (isAttestto) {
-      services.push({
-        id: `${did}#sns-domain`,
-        type: 'LinkedDomains',
-        serviceEndpoint: `https://${parsed.name}.sol`,
-      })
-
-      services.push({
-        id: `${did}#attestto-platform`,
-        type: 'VerifiablePresentationService',
-        serviceEndpoint: {
-          origins: ['https://app.attestto.com'],
-          presentations: `https://api.attestto.com/ssi/my-credentials`,
-        },
-      })
-    }
-
-    // Add DIDComm messaging service if DID metadata is present and active
-    if (meta?.hasMetadata && meta.active) {
-      services.push({
-        id: `${did}#didcomm`,
-        type: 'DIDCommMessaging',
-        serviceEndpoint: {
-          uri: `https://api.attestto.com/didcomm/`,
-          accept: ['didcomm/v2'],
-          routingKeys: [],
-        },
-      })
-    }
-
-    // Add vault endpoint hash as a service if present
-    if (meta?.hasMetadata && meta.vaultEndpointHash && meta.vaultEndpointHash !== '0'.repeat(64)) {
-      services.push({
-        id: `${did}#vault`,
-        type: 'EncryptedVault',
-        serviceEndpoint: {
-          endpointHash: meta.vaultEndpointHash,
-          encryptionScheme: 'Shamir-2-of-2-XOR',
-        },
-      })
-    }
-
-    // Add SAS attestation reference if present (v2)
-    if (meta?.hasSas && meta.sasAttestationUid) {
-      services.push({
-        id: `${did}#sas-attestation`,
-        type: 'SasAttestation',
-        serviceEndpoint: {
-          attestationPda: meta.sasAttestationUid,
-          network: parsed.network,
-        },
-      })
-    }
-
-    // Add status list service only for Attestto domains
-    if (isAttestto) {
-      services.push({
-        id: `${did}#status-list`,
-        type: 'BitstringStatusList',
-        serviceEndpoint: `https://api.attestto.com/api/status/`,
-      })
-    }
+    // ── §8.6 service endpoints ──────────────────────────────────────────
+    //
+    // §1: the method is "operator-agnostic — any SNS domain owner … can anchor
+    // DIDs under their namespace". §8.4: "Service endpoints point to the
+    // tenant's infrastructure (whitelabel)."
+    //
+    // This block used to attach `api.attestto.com` / `app.attestto.com` VP,
+    // DIDComm and status-list endpoints to EVERY document, sourced from nothing
+    // on-chain — so resolving an independent operator's DID told every verifier
+    // to fetch that subject's presentations and revocation status from a third
+    // party they have no relationship with. §12.5 lists exactly that
+    // ("repoint the vault / VP / DIDComm service endpoints") as an ATTACKER
+    // capability. A public DIF driver performing it by default is worse than an
+    // attacker doing it once.
+    //
+    // Nothing is emitted that the chain did not supply:
+    //
+    //   - `LinkedDomains https://<name>.sol` was fabricated from the name, and
+    //     asserted a hostname in a TLD that does not exist in DNS.
+    //     `LinkedDomains` is also not among §8.6's five service types.
+    //   - the vault entry carried `EncryptedVault` (§8.6 defines
+    //     `EncryptedDataVault`) with the buffer's *hash* where §8.2/§8.4 put a
+    //     URL. §10 is explicit that the buffer holds "SHA-256 of vault service
+    //     endpoint URL" — a commitment, not an endpoint. A hash cannot be
+    //     dereferenced, so there is no conformant value to emit. It stays in
+    //     `snsMetadata`, where a consumer that knows the URL can check it.
+    //   - `SasAttestation` is not a §8.6 type. The UID is already reported in
+    //     `didResolutionMetadata.snsMetadata`, so nothing is lost by dropping
+    //     the service entry.
+    //
+    // An operator that wants its own endpoints advertised configures them; the
+    // driver ships neutral. Per Rule 0, a resolver does not invent an endpoint
+    // any more than it invents a key.
+    const services: ServiceEndpoint[] = this.deps.operatorServices(did, parsed.network)
 
     const doc: DidDocument = {
       '@context': DID_CONTEXT,
