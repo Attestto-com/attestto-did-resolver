@@ -59,7 +59,14 @@ export class DidPkiResolver {
         pemContents.set(entry.cert.file, this.registry.readPem(entry));
       }
 
-      const { document, metadata } = buildDidDocument(filteredEntries, pemContents);
+      // The certificate's own CRL Distribution Point decides which list covers
+      // it. Passing the country's lookup is what finally makes
+      // `revocationChecked` capable of being true.
+      const { document, metadata } = buildDidDocument(
+        filteredEntries,
+        pemContents,
+        this.registry.getRevocation(parsed.countryCode)
+      );
 
       return {
         '@context': 'https://w3id.org/did-resolution/v1',

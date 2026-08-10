@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { createRevocationLookup, type RevocationLookup, type RevocationSnapshot } from './revocation-store.js';
 import { join, resolve } from 'node:path';
 import { X509Certificate } from 'node:crypto';
 import type { CountryManifest, CertificateEntry, RegistryEntry } from './types.js';
@@ -37,6 +38,9 @@ export class TrustRegistry {
   /** Map: country code → all entries */
   private byCountry = new Map<string, RegistryEntry[]>();
 
+  /** Map: country code → CRL revocation lookup built from that country's snapshot. */
+  private revocation = new Map<string, RevocationLookup>();
+
   /** Base path to attestto-trust/countries/ */
   private trustStorePath: string;
 
@@ -74,6 +78,23 @@ export class TrustRegistry {
     if (!existsSync(manifestPath)) return;
 
     const manifest: CountryManifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+
+    // `countries/<cc>/revocation.json` ships in the same tarball as the
+    // manifest. It is optional: a trust store published before the snapshot
+    // existed simply has none, and every certificate then reports
+    // `revocationChecked: false` — the honest answer, not a failure.
+    const revocationPath = join(this.trustStorePath, cc, 'revocation.json');
+    let snapshot: RevocationSnapshot | null = null;
+    if (existsSync(revocationPath)) {
+      try {
+        snapshot = JSON.parse(readFileSync(revocationPath, 'utf-8')) as RevocationSnapshot;
+      } catch {
+        // A malformed snapshot must not be read as "nothing revoked". Leaving
+        // it null means unchecked, which is what it is.
+        snapshot = null;
+      }
+    }
+    this.revocation.set(cc, createRevocationLookup(snapshot));
     const entries: RegistryEntry[] = [];
 
     // Enrich certs with O/CN from PEM if not already in manifest
@@ -189,6 +210,15 @@ export class TrustRegistry {
   }
 
   /** Get all entries for a country */
+  /**
+   * The revocation lookup for a country, or one reporting everything unchecked
+   * when no snapshot shipped. Never undefined: a caller forced to decide
+   * whether a check is possible is one more place the check gets skipped.
+   */
+  getRevocation(countryCode: string): RevocationLookup {
+    return this.revocation.get(countryCode) ?? createRevocationLookup(null);
+  }
+
   getCountryEntries(countryCode: string): RegistryEntry[] {
     return this.byCountry.get(countryCode.toLowerCase()) ?? [];
   }
@@ -198,3 +228,4 @@ export class TrustRegistry {
     return readFileSync(entry.pemPath, 'utf-8');
   }
 }
+

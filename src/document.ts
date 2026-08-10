@@ -9,6 +9,7 @@ import type {
   PkiMetadata,
 } from './types.js';
 import { getCountryConfig } from './countries.js';
+import type { RevocationLookup } from './revocation-store.js';
 
 /**
  * Minimal DER TLV reader — returns the tag, the content offset, and the end
@@ -195,6 +196,13 @@ export function getGenerationStatus(
 export function buildDidDocument(
   entries: RegistryEntry[],
   pemContents: Map<string, string>,
+  /**
+   * Consulted per certificate against the CRL its own CRL Distribution Point
+   * names. Optional: when absent, every generation reports
+   * `revocationChecked: false` — which is the honest answer, and was the only
+   * answer this function could give before.
+   */
+  revocation?: RevocationLookup,
 ): { document: DidDocument; metadata: DidDocumentMetadata } {
   if (entries.length === 0) {
     throw new Error('No entries provided');
@@ -235,7 +243,17 @@ export function buildDidDocument(
 
     assertionMethods.push(vmId);
 
-    const status = getGenerationStatus(entry.cert.validFrom, entry.cert.validTo);
+    let status: GenerationStatus | 'revoked' = getGenerationStatus(
+      entry.cert.validFrom,
+      entry.cert.validTo
+    );
+
+    // Revocation outranks the validity window: a revoked certificate is revoked
+    // whether or not it has also expired, and a verifier needs to know which.
+    const verdict = revocation
+      ? revocation.check(entry.cert.serialNumber, entry.cert.crlUrls)
+      : { checked: false, revoked: false };
+    if (verdict.revoked) status = 'revoked';
 
     generations.push({
       keyId,
@@ -245,11 +263,11 @@ export function buildDidDocument(
       fingerprint: sha256Fingerprint,
       fingerprintAlgorithm: 'sha-256',
       status,
-      // Stated, not implied. did:pki consults no revocation source for CA
-      // certificates, so a consumer must read this as "unknown" rather than
-      // "good" — see the field's doc comment for why the CRL this process
-      // already runs is the wrong list.
-      revocationChecked: false,
+      // Stated, not implied. `false` means UNKNOWN — a root with no CRL
+      // Distribution Point, a CDP that did not respond, or a CRL past its own
+      // nextUpdate, whose silence carries no information. A consumer that
+      // requires revocation assurance must never read it as "good".
+      revocationChecked: verdict.checked,
     });
 
     // Extract services from first generation only (they're usually the same)

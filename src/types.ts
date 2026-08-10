@@ -20,6 +20,16 @@ export interface CertificateEntry {
   organization?: string;
   /** Common Name (CN) field from Subject DN — optional, extracted from PEM if not in manifest */
   commonName?: string;
+  /**
+   * CRL Distribution Points from the certificate's own extension, as recorded
+   * by attestto-trust's `refresh-manifest.mjs`. These name the CRL where THIS
+   * certificate would appear if its issuer revoked it — the only correct source
+   * for its revocation status. Absent on self-signed roots, which are not
+   * CRL-revocable.
+   */
+  crlUrls?: string[];
+  /** OCSP responders from the Authority Information Access extension. */
+  ocspUrls?: string[];
 }
 
 /** Country manifest from attestto-trust */
