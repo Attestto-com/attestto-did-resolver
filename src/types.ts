@@ -96,13 +96,49 @@ export interface DidDocument {
   pkiMetadata: PkiMetadata;
 }
 
-/** W3C DID Document Metadata */
+/**
+ * W3C DID Document Metadata.
+ *
+ * Every property is OPTIONAL per DID Core — and this mattered. `created`,
+ * `updated` and `versionId` were declared required, so the error path had to
+ * supply them and filled in `''`. But `created`/`updated` are XMLSchema
+ * dateTime, and `""` is not a value of that type, so every did:pki failure
+ * shipped an invalid resolution result — produced BY the type, to satisfy the
+ * type. On a failure there is no document, so there is no metadata about one:
+ * the correct value is `{}`.
+ */
 export interface DidDocumentMetadata {
-  created: string;
-  updated: string;
+  created?: string;
+  updated?: string;
   deactivated?: boolean;
   nextUpdate?: string;
-  versionId: string;
+  versionId?: string;
+}
+
+/**
+ * W3C DID Resolution Metadata.
+ *
+ * `errorMessage` is the DID Resolution property. This type declared `message`,
+ * which is why `did:pki` emitted a field no conforming client reads while
+ * `did:sns` — on the same server — emitted the right one: the two methods
+ * disagreed because the TYPE let one of them be wrong.
+ *
+ * `contentType` describes the returned representation, so it is optional: on a
+ * failure `didDocument` is null and there is nothing to describe. It was
+ * required, so every error result declared a representation that did not
+ * exist — and declared `application/did+json` while the server wrote
+ * `application/did+ld+json` in the header.
+ */
+export interface DidResolutionMetadata {
+  contentType?: string;
+  error?: string;
+  errorMessage?: string;
+  /** Resolution wall time in ms, reported by the sns resolver. */
+  duration?: number;
+  /** Set when a transient failure invites an immediate retry. */
+  retriable?: boolean;
+  /** did:sns on-chain metadata (owner, network, DID metadata flags). */
+  snsMetadata?: Record<string, unknown>;
 }
 
 /** W3C DID Resolution Result */
@@ -110,11 +146,7 @@ export interface DidResolutionResult {
   '@context': string;
   didDocument: DidDocument | null;
   didDocumentMetadata: DidDocumentMetadata;
-  didResolutionMetadata: {
-    contentType: string;
-    error?: string;
-    message?: string;
-  };
+  didResolutionMetadata: DidResolutionMetadata;
 }
 
 /** Country metadata for building pkiMetadata */

@@ -28,6 +28,8 @@ import { checkBearer } from './admin-auth.js'
 import { readBodyCapped, clientIp } from './http-utils.js'
 import { RateLimiter, DEFAULT_RATE_LIMIT } from './rate-limit.js'
 import { loadAllowedOrigins, corsHeadersFor } from './cors.js'
+import { statusForResolution, resolutionError } from './resolution.js'
+import { parseDidUrl } from './parser.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -290,7 +292,28 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
   // DID Resolution endpoint — route by method
   const identifierMatch = url.pathname.match(/^\/1\.0\/identifiers\/(.+)$/)
   if (identifierMatch && method === 'GET') {
-    const did = decodeURIComponent(identifierMatch[1])
+    // A malformed percent-escape throws URIError. Unguarded, it fell through to
+    // the process-wide catch and answered 500 `internalError` for what is a
+    // client typo — and, once the rate limiter refunds on that code, composed
+    // into an unmetered retry loop. `attestto-trust`'s cert pages interpolate a
+    // DID into this URL unencoded, so this is reachable by accident.
+    let rawIdentifier: string
+    try {
+      rawIdentifier = decodeURIComponent(identifierMatch[1])
+    } catch {
+      sendJson(res, 400, resolutionError('invalidDid', 'Malformed percent-encoding in identifier'))
+      return
+    }
+
+    // Accept a DID URL, not only a bare DID. `did:pki:cr:sinpe:persona-fisica#key-1`
+    // is the shape of a `kid` read straight out of a JWS header — the most
+    // natural thing a consumer holds — and used to come back invalidDid.
+    const didUrl = parseDidUrl(rawIdentifier)
+    if (!didUrl) {
+      sendJson(res, 400, resolutionError('invalidDid', `Not a DID: ${rawIdentifier}`))
+      return
+    }
+    const did = didUrl.did
 
     log('info', 'Resolving DID', { did })
     const startTime = Date.now()
@@ -323,16 +346,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     // transient TLS/SSL errors are retried: hand back the rate-limit token so the
     // retry isn't throttled, keep the W3C resolution shape (200, null document),
     // flag it retriable, and tell the caller to retry now (Retry-After: 0).
+    // A transient upstream failure is worth an immediate retry, so the caller
+    // gets its rate-limit token back and a `Retry-After: 0`. But the STATUS
+    // must still say failure: this used to answer 200, and every DIF consumer
+    // here gates on `res.ok`, so a dead RPC read as a successful resolution of
+    // a null document.
     if (hasError === 'internalError') {
       rateLimiter.refund(ip)
       log('warn', 'Resolution transient error — inviting immediate retry', { did, duration, ip })
       result.didResolutionMetadata = { ...result.didResolutionMetadata, retriable: true }
       res.setHeader('Retry-After', '0')
-      sendJson(res, 200, result)
-      return
     }
 
-    const status = hasError ? (hasError === 'notFound' ? 404 : hasError === 'invalidDid' ? 400 : 500) : 200
+    const status = statusForResolution(hasError)
 
     log(
       hasError ? 'warn' : 'info',

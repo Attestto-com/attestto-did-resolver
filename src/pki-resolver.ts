@@ -2,6 +2,7 @@ import type { DidResolutionResult } from './types.js';
 import { parseDid } from './parser.js';
 import { TrustRegistry } from './registry.js';
 import { buildDidDocument } from './document.js';
+import { resolutionError } from './resolution.js';
 
 /**
  * did:pki Resolver
@@ -79,20 +80,14 @@ export class DidPkiResolver {
     return this.registry.getAllDids();
   }
 
+  /**
+   * Delegates to the shared shape so both methods on this server report a
+   * failure identically. This used to emit `message` (not a DID Resolution
+   * property), a `didDocumentMetadata` of empty strings where `created` and
+   * `updated` are XMLSchema dateTime, and a `contentType` describing a
+   * representation that does not exist because `didDocument` is null.
+   */
   private error(code: string, message: string): DidResolutionResult {
-    return {
-      '@context': 'https://w3id.org/did-resolution/v1',
-      didDocument: null,
-      didDocumentMetadata: {
-        created: '',
-        updated: '',
-        versionId: '',
-      },
-      didResolutionMetadata: {
-        contentType: 'application/did+json',
-        error: code,
-        message,
-      },
-    };
+    return resolutionError(code, message);
   }
 }
