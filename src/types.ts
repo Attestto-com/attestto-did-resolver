@@ -66,7 +66,28 @@ export interface GenerationMeta {
   serialNumber: string;
   fingerprint: string;
   fingerprintAlgorithm: 'sha-256';
-  status: 'active' | 'expired' | 'revoked';
+  /**
+   * Validity-window state. `revoked` is declared because a revocation-aware
+   * build should be able to report it — but NOTHING in this resolver produces
+   * it today, which is why `revocationChecked` sits beside it.
+   */
+  status: 'active' | 'expired' | 'not-yet-valid' | 'unknown' | 'revoked';
+  /**
+   * Whether this resolver checked a revocation source for this certificate.
+   *
+   * Always false today, and stated rather than implied. `did:pki` consults no
+   * CRL or OCSP responder for CA certificates: the CRL service this process
+   * runs covers `sinpe-persona-fisica` / `sinpe-persona-juridica`, which are
+   * END-ENTITY lists — the certificates those CAs issue — not the CAs
+   * themselves. Checking a CA against its own subscribers' list would be a
+   * control that looks more convincing and covers less.
+   *
+   * A consumer that requires revocation assurance must treat
+   * `revocationChecked: false` as "unknown", never as "good". Without this
+   * field the two are indistinguishable, which is what made
+   * attestto-verify's revocation branch vacuous.
+   */
+  revocationChecked: boolean;
 }
 
 /** pkiMetadata extension */
