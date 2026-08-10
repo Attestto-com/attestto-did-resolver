@@ -26,7 +26,8 @@ import { CrlRevocationService } from './crl-revocation.js'
 import { RefreshManager, type TrustState } from './trust-refresh.js'
 import { checkBearer } from './admin-auth.js'
 import { readBodyCapped, clientIp } from './http-utils.js'
-import { RateLimiter } from './rate-limit.js'
+import { RateLimiter, DEFAULT_RATE_LIMIT } from './rate-limit.js'
+import { loadAllowedOrigins, corsHeadersFor } from './cors.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -36,9 +37,14 @@ const REFRESH_SECRET = process.env.REFRESH_SECRET
 // ── Rate limiting ───────────────────────────────────────────────────
 // Per-client-IP throttle for the public, unauthenticated surface. Defaults to
 // 1 request per 5s per IP; /health and / (status) are exempt (see handleRequest).
-const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 1)
-const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 5000)
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || DEFAULT_RATE_LIMIT.maxRequests)
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || DEFAULT_RATE_LIMIT.windowMs)
 const rateLimiter = new RateLimiter({ windowMs: RATE_LIMIT_WINDOW_MS, maxRequests: RATE_LIMIT_MAX })
+
+// `X-Forwarded-For` is caller-controlled. Behind Fly the edge sets
+// `Fly-Client-IP`, which is preferred anyway, so this stays off unless a
+// deployment knows a trusted proxy overwrites the header.
+const TRUST_FORWARDED_FOR = process.env.TRUST_FORWARDED_FOR === 'true'
 
 // ── Initialize resolvers ────────────────────────────────────────────
 
@@ -74,24 +80,30 @@ log('info', `[did:sns] Solana RPC: ${process.env.SOLANA_RPC_URL || 'mainnet publ
 // ── CORS ────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-let allowedOrigins: string[] = []
-try {
-  const raw = readFileSync(join(__dirname, 'cors-whitelist.json'), 'utf-8')
-  allowedOrigins = JSON.parse(raw).allowedOrigins || []
-} catch {
-  allowedOrigins = process.env.NODE_ENV === 'production' ? [] : ['*']
-}
+
+/**
+ * Loaded at boot, and NOT wrapped in a try/catch.
+ *
+ * The previous version fell back to `NODE_ENV === 'production' ? [] : ['*']` on
+ * any read failure — and since `tsc` emits no `.json`, the Dockerfile copied
+ * only `dist/`, and `NODE_ENV` was set nowhere, every built image ran with
+ * `['*']` and reflected any Origin. The allowlist described a control that had
+ * never executed.
+ *
+ * A throw here stops the process. That is the intended behaviour: a resolver
+ * that cannot load its origin policy must not serve traffic pretending it has
+ * one.
+ */
+const allowedOrigins = loadAllowedOrigins(() =>
+  readFileSync(join(__dirname, 'cors-whitelist.json'), 'utf-8'),
+)
+log('info', `CORS: ${allowedOrigins.length} allowed origins`)
 
 function setCorsHeaders(req: IncomingMessage, res: ServerResponse): boolean {
-  const origin = req.headers.origin || ''
-  if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept')
-    res.setHeader('Access-Control-Max-Age', '86400')
-    return true
-  }
-  return false
+  const headers = corsHeadersFor(req.headers.origin, allowedOrigins)
+  if (!headers) return false
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value)
+  return true
 }
 
 // ── Logging ─────────────────────────────────────────────────────────
@@ -160,7 +172,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
   // Rate limit — per client IP, 1 req / 5s by default. /health and / returned
   // above and are exempt so uptime checks and Fly health probes are never throttled.
-  const ip = clientIp(req)
+  const ip = clientIp(req, { trustForwardedFor: TRUST_FORWARDED_FOR })
   const limit = rateLimiter.check(ip)
   if (!limit.allowed) {
     log('warn', 'Rate limited', { ip, path: url.pathname, retryAfterSec: limit.retryAfterSec })

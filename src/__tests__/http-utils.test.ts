@@ -50,9 +50,16 @@ test('clientIp prefers the Fly-Client-IP header', () => {
   assert.equal(clientIp(req), '203.0.113.7')
 })
 
-test('clientIp falls back to the first X-Forwarded-For hop', () => {
+test('clientIp IGNORES X-Forwarded-For unless a deployment opts in (SOC-175)', () => {
+  // This test previously asserted the opposite. `X-Forwarded-For` is an
+  // ordinary request header under the caller's control, so honouring it by
+  // default hands a caller their own rate-limit key — rotate it per request
+  // for unlimited quota, and plant unbounded keys in the limiter's map on the
+  // way. The behaviour changed; the assertion follows it rather than the other
+  // way round.
   const req = fakeReq({ 'x-forwarded-for': '203.0.113.9, 10.0.0.1, 10.0.0.2' }, '172.16.0.1')
-  assert.equal(clientIp(req), '203.0.113.9')
+  assert.equal(clientIp(req), '172.16.0.1', 'the socket address is the unspoofable source')
+  assert.equal(clientIp(req, { trustForwardedFor: true }), '203.0.113.9')
 })
 
 test('clientIp falls back to the socket address', () => {
