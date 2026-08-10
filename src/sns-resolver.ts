@@ -16,6 +16,7 @@
 
 import { Connection, PublicKey } from '@solana/web3.js'
 import { createHash } from 'node:crypto'
+import { parseSnsDid, type SnsNetwork } from './sns-parse.js'
 
 // ── SNS Constants ────────────────────────────────────────────────────────────
 
@@ -68,9 +69,11 @@ interface DidMetadata {
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface ParsedSnsDid {
+  /** The identifier as the caller wrote it — DID Core: the document `id` is the DID resolved. */
   did: string
+  /** Suffix-stripped, selector-removed: what §9.2 step 4 hashes. */
   name: string
-  network: string
+  network: SnsNetwork
 }
 
 export interface DidDocument {
@@ -120,57 +123,88 @@ export interface DidDocumentMetadata {
   versionId?: string
 }
 
+// ── Injected dependencies ────────────────────────────────────────────────────
+
+/**
+ * Reads a NameRegistry account. Injected so resolution can be exercised without
+ * a Solana RPC — the reason this file had zero tests while carrying four spec
+ * violations. The default implementation below preserves the previous
+ * behaviour exactly for callers that pass nothing.
+ */
+export interface SnsAccountReader {
+  fetchAccount(address: string, network: SnsNetwork): Promise<Buffer | null>
+}
+
+export interface DidSnsResolverDeps extends SnsAccountReader {
+  /** Injected so `duration` is not wall-clock in tests. */
+  now?: () => number
+}
+
 // ── Resolver ─────────────────────────────────────────────────────────────────
 
 export class DidSnsResolver {
   private connectionCache: Map<string, Connection> = new Map()
+  private readonly deps: Required<DidSnsResolverDeps>
+
+  constructor(deps?: DidSnsResolverDeps) {
+    this.deps = {
+      fetchAccount: deps?.fetchAccount ?? ((address, network) => this.readFromRpc(address, network)),
+      now: deps?.now ?? (() => Date.now()),
+    }
+  }
+
+  /** The default reader: a live Solana RPC, as before. */
+  private async readFromRpc(address: string, network: SnsNetwork): Promise<Buffer | null> {
+    const rpcUrl =
+      process.env.SOLANA_RPC_URL || NETWORK_ENDPOINTS[network] || NETWORK_ENDPOINTS.mainnet
+    const info = await this.getConnection(rpcUrl).getAccountInfo(new PublicKey(address))
+    return info ? info.data : null
+  }
 
   /**
    * Resolve a did:sns DID to a W3C DID Resolution Result.
    */
   async resolve(did: string): Promise<DidResolutionResult> {
-    const startTime = Date.now()
+    const startTime = this.deps.now()
 
     try {
-      // Step 1: Parse
-      const parsed = this.parseDid(did)
-      if (!parsed) {
-        return this.errorResult('invalidDid', `Cannot parse DID: ${did}`)
+      // ── §9.2 steps 1-3: parse, strip `.sol`, validate depth ──────────────
+      //
+      // Delegated to `sns-parse.ts`, which implements §7.1's ABNF, §7.1's
+      // reserved network selectors and §9.2's strip-before-depth ordering. It
+      // runs BEFORE any account read, so a malformed name can no longer become
+      // a PDA lookup — `did:sns:alice.` used to derive a key from an empty
+      // label and answer notFound.
+      const parsed = parseSnsDid(did)
+      if (!parsed.ok) {
+        // §9.2's error set is closed (invalidDid / notFound / deactivated /
+        // internalError) and names no code for a depth failure, so `tooDeep`
+        // maps onto invalidDid rather than inventing a fifth wire value.
+        // SOC-177 asks the spec to name one.
+        return this.errorResult('invalidDid', parsed.message)
       }
+      const { name, network } = parsed.value
 
-      // Step 2: Derive PDA
-      const domainParts = parsed.name.split('.')
-      if (domainParts.length > 2) {
-        return this.errorResult(
-          'invalidDid',
-          'SNS supports max 2 levels (parent.subdomain)'
-        )
-      }
-
-      // Step 3: Fetch on-chain
-      const rpcUrl = process.env.SOLANA_RPC_URL || NETWORK_ENDPOINTS[parsed.network] || NETWORK_ENDPOINTS.mainnet
-      const connection = this.getConnection(rpcUrl)
-
-      const domainData = await this.fetchDomainData(connection, parsed.name)
+      const domainData = await this.fetchDomainData(name, network)
       if (!domainData) {
-        return this.errorResult('notFound', `No did:sns DID found for: ${parsed.did}`)
+        return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
       }
 
       // Verify did:sns compliance — domain must have DID metadata or be an Attestto domain
-      const isAttesttoCompliant = domainData.didMetadata?.hasMetadata || parsed.name.includes('attestto')
+      const isAttesttoCompliant = domainData.didMetadata?.hasMetadata || name.includes('attestto')
       if (!isAttesttoCompliant) {
-        return this.errorResult('notFound', `No did:sns DID found for: ${parsed.did}`)
+        return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
       }
 
       // Step 4: Build DID Document
-      const didDocument = this.buildDidDocument(parsed, domainData)
+      const didDocument = this.buildDidDocument({ did, name, network }, domainData)
 
-      const duration = Date.now() - startTime
+      const duration = this.deps.now() - startTime
 
       // Include on-chain DID metadata in resolution metadata
       const snsMetadata: Record<string, unknown> = {
         owner: domainData.owner,
-        network: parsed.network,
+        network,
         classKey: domainData.classKey,
       }
 
@@ -206,26 +240,6 @@ export class DidSnsResolver {
   }
 
   /**
-   * Parse a did:sns DID string.
-   *
-   * Formats:
-   *   did:sns:alice.attestto          → mainnet, name = alice.attestto
-   *   did:sns:devnet:alice.attestto   → devnet, name = alice.attestto
-   *   did:sns:alice                   → mainnet, name = alice (root domain)
-   */
-  private parseDid(did: string): ParsedSnsDid | null {
-    const match = did.match(/^did:sns:(?:(mainnet|devnet|testnet):)?([a-zA-Z0-9][\w.-]*)$/)
-    if (!match) return null
-
-    const network = match[1] || 'mainnet'
-    const name = match[2]
-
-    if (!name || name.length === 0) return null
-
-    return { did, name, network }
-  }
-
-  /**
    * Hash a domain name for SNS PDA derivation.
    */
   private hashDomainName(name: string): Buffer {
@@ -237,8 +251,8 @@ export class DidSnsResolver {
    * Fetch domain data from Solana Name Service.
    */
   private async fetchDomainData(
-    connection: Connection,
-    name: string
+    name: string,
+    network: SnsNetwork
   ): Promise<{ owner: string; classKey: string | null; didMetadata: DidMetadata | null } | null> {
     const parts = name.split('.')
 
@@ -272,8 +286,8 @@ export class DidSnsResolver {
       domainKey = subKey
     }
 
-    const accountInfo = await connection.getAccountInfo(domainKey)
-    if (!accountInfo || accountInfo.data.length < 96) {
+    const data = await this.deps.fetchAccount(domainKey.toBase58(), network)
+    if (!data || data.length < 96) {
       return null
     }
 
@@ -281,18 +295,18 @@ export class DidSnsResolver {
     // bytes 0-31:  parentName (PublicKey)
     // bytes 32-63: owner (PublicKey)
     // bytes 64-95: class (PublicKey) — zero = unlocked
-    const ownerBytes = accountInfo.data.slice(32, 64)
+    const ownerBytes = data.slice(32, 64)
     const owner = new PublicKey(ownerBytes).toBase58()
 
     let classKey: string | null = null
-    const classKeyBytes = accountInfo.data.slice(64, 96)
+    const classKeyBytes = data.slice(64, 96)
     const classKeyPub = new PublicKey(classKeyBytes)
     if (!classKeyPub.equals(PublicKey.default)) {
       classKey = classKeyPub.toBase58()
     }
 
     // Parse DID metadata from data buffer (bytes 96+)
-    const didMetadata = this.parseDidMetadata(accountInfo.data)
+    const didMetadata = this.parseDidMetadata(data)
 
     return { owner, classKey, didMetadata }
   }
