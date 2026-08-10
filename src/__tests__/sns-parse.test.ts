@@ -227,10 +227,15 @@ describe('§7.2 — two levels maximum (root + one subdomain)', () => {
 
   test('§7.2: nested beyond one subdomain is refused', () => {
     // Refused, code unasserted — §7.2 says only "rejected by resolver".
-    // ⚠️ These are IN USE: `user.tenant.attestto.sol` is the documented Tier 2
-    // identifier (creds-extension CLAUDE.md:50), `notario-garcia.abogados.
-    // attestto.sol` ships in cr-vc-schemas examples, and did-sns-spec itself
-    // ships `did:sns:attestto.officer.1`. Spec vs product — SOC-177.
+    //
+    // SNS is `subdomain.domain`. Two levels is a property of Solana Name
+    // Service, not a policy: a three-label name has no PDA to derive, so it is
+    // IMPOSSIBLE rather than disallowed. Several artefacts write one anyway —
+    // `user.tenant.attestto.sol` (creds-extension CLAUDE.md:50),
+    // `notario-garcia.abogados.attestto.sol` (cr-vc-schemas examples),
+    // `attestto.officer.1` (did-sns-spec's own credential README, contradicting
+    // its §7.2). Those are DOC BUGS. The tenant IS the domain: a Tier 2 identity
+    // is `alice.crbank`, never `alice.crbank.attestto`.
     refused('did:sns:dept.alice.crbank')
     refused('did:sns:user.tenant.attestto.sol')
     refused('did:sns:a.b.c.d')
