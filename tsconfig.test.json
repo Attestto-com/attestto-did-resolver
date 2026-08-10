@@ -1,0 +1,11 @@
+{
+  // Type-checks the TESTS, which `tsconfig.json` deliberately excludes so that
+  // `npm run build` does not emit them into `dist/`. Without this file
+  // `tsc --noEmit` never sees a spec — verified: `--listFiles | grep -c __tests__`
+  // returned 0 — so a type assertion inside a test was never checked.
+  // Used by CI only; emits nothing.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["src/**/*.ts"],
+  "exclude": []
+}

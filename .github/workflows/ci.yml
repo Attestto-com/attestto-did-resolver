@@ -49,8 +49,21 @@ jobs:
           fi
           echo "Stub guard passed"
 
-      - name: Type check
+      - name: Type check (sources)
         run: npx tsc --noEmit
+
+      # `tsconfig.json` excludes tests so `npm run build` does not emit them
+      # into dist/. Without this second pass no spec is ever type-checked —
+      # measured: `tsc --noEmit --listFiles | grep -c __tests__` was 0.
+      - name: Type check (tests)
+        run: npx tsc --noEmit -p tsconfig.test.json
+
+      # This step is the point of SOC-170. Nine test suites existed and CI ran
+      # none of them, so seven spec violations reached a public endpoint. A
+      # pipeline that builds without testing signals a confidence nobody
+      # earned. If this step is ever removed, gate-self-test.test.ts goes red.
+      - name: Test
+        run: npm test
 
       - name: Build
         run: npm run build
