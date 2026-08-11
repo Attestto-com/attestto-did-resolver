@@ -30,6 +30,7 @@ import { RateLimiter, DEFAULT_RATE_LIMIT } from './rate-limit.js'
 import { loadAllowedOrigins, corsHeadersFor } from './cors.js'
 import { statusForResolution, resolutionError } from './resolution.js'
 import { parseDidUrl } from './parser.js'
+import { healthReport } from './health.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -154,10 +155,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     return
   }
 
-  // Health check
+  // Health check.
+  //
+  // The verdict is DERIVED from trust state (see health.ts), not asserted. This
+  // used to return a hardcoded `status: 'ok'` alongside the very fields that
+  // showed it was not — so every uptime monitor pointed here reported green
+  // while the instance served baked trust data that had never refreshed.
   if (url.pathname === '/health' || url.pathname === '/') {
-    sendJson(res, 200, {
-      status: 'ok',
+    const health = healthReport(state.meta, Date.now(), REFRESH_INTERVAL_MS)
+    sendJson(res, health.httpStatus, {
+      status: health.status,
+      reasons: health.reasons,
       driver: 'attestto-did-resolver',
       version: '0.1.0',
       supportedMethods: ['pki', 'sns'],

@@ -6,6 +6,35 @@ import type { CountryManifest, CertificateEntry, RegistryEntry } from './types.j
 import { derivePathKey } from './normalize.js';
 
 /**
+ * Is `file` a plain filename that stays inside its country directory?
+ *
+ * `manifest.certificates[].file` was interpolated straight into
+ * `join(trustStorePath, cc, 'current', file)`, and `join` RESOLVES `..` rather
+ * than refusing it — so `../../../outside/x.pem` read whatever the resolver's
+ * user could read, and a PEM-shaped target would have had its key material
+ * published in a DID document.
+ *
+ * The manifest is not request input; it ships in the `@attestto/trust` tarball
+ * that `trust-refresh.ts` re-fetches on a timer. That is the reason to check it
+ * rather than the excuse not to: it is remote data the process performs
+ * filesystem operations from.
+ *
+ * ALLOWLIST, not blocklist. "No `..`" has a decade of bypasses — `....//`,
+ * percent-encodings, backslashes on the wrong platform, absolute paths.
+ * "Exactly one path segment, no separators, no `.` or `..`" has none to
+ * enumerate. Real filenames (`CA SINPE - PERSONA FISICA v2 (2023).pem`) pass;
+ * anything with structure does not.
+ */
+function isPlainFilename(file: string): boolean {
+  if (typeof file !== 'string' || file.length === 0) return false;
+  if (file.includes('/') || file.includes('\\')) return false;
+  // `\0` truncates the path at the syscall boundary in some runtimes, making
+  // the suffix the check saw invisible to the filesystem.
+  if (file.includes('\0')) return false;
+  return file !== '.' && file !== '..';
+}
+
+/**
  * Parse the Subject DN string from Node's X509Certificate into components.
  * Node returns format like: "C=CR\nO=BCCR\nCN=CA SINPE - PERSONA FISICA v2"
  */
@@ -78,6 +107,26 @@ export class TrustRegistry {
     if (!existsSync(manifestPath)) return;
 
     const manifest: CountryManifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+
+    // Drop any certificate whose `file` is not a plain filename, BEFORE it is
+    // used to build a path. Dropping rather than throwing: one malformed entry
+    // must not take a whole country's trust store offline, and an entry that is
+    // never indexed produces no DID, so nothing it names can reach a response.
+    const rejected = manifest.certificates.filter((c) => !isPlainFilename(c.file));
+    if (rejected.length > 0) {
+      // Loud, because a manifest that tries to leave its directory is either a
+      // build defect in attestto-trust or something that warrants a look — and
+      // silence here is what let it be unnoticed in the first place.
+      console.warn(
+        JSON.stringify({
+          level: 'warn',
+          msg: 'Rejected certificate entries with a non-plain file name',
+          country: cc,
+          files: rejected.map((c) => c.file),
+        }),
+      );
+      manifest.certificates = manifest.certificates.filter((c) => isPlainFilename(c.file));
+    }
 
     // `countries/<cc>/revocation.json` ships in the same tarball as the
     // manifest. It is optional: a trust store published before the snapshot
