@@ -13,7 +13,11 @@
  */
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { createRevocationLookup } from '../revocation-store.js'
+import {
+  createRevocationLookup,
+  type RevocationCrlEntry,
+  type RevocationSnapshot,
+} from '../revocation-store.js'
 
 const CRL_A = 'http://ca.example/a.crl'
 const CRL_B = 'http://ca.example/b.crl'
@@ -21,7 +25,7 @@ const HOUR = 3_600_000
 const NOW = 1_760_000_000_000
 const iso = (o: number) => new Date(NOW + o).toISOString()
 
-function snapshot(crls: unknown[]) {
+function snapshot(crls: RevocationCrlEntry[]): RevocationSnapshot {
   return {
     country: 'XX',
     generatedAt: iso(-HOUR),

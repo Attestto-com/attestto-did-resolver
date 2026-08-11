@@ -77,11 +77,15 @@ const FISICA: CrCa = 'sinpe-persona-fisica';
 /**
  * A clock inside the fixture CRL's own validity window.
  *
- * This asserted `stale === false` against `Date.now()` while the fixture is a
- * static file whose `nextUpdate` is 7 days after it was generated offline
- * (2026-07-29). It passed on the day it was written and has failed every day
- * since. Deriving the clock FROM the fixture makes staleness a property of the
- * data rather than of the calendar.
+ * This test used to pass `Date.now()` and assert `stale === false`. The fixture
+ * is a static file whose `nextUpdate` is 7 days after it was generated offline
+ * (2026-07-29), so the test passed on the day it was written and has failed
+ * every day since — a time bomb, and the reason `npm test` was red. It was
+ * never wrong about behaviour, only about time.
+ *
+ * Deriving the clock FROM the fixture makes staleness a property of the data
+ * rather than of the calendar. Regenerating the fixture cannot silently
+ * re-arm it.
  */
 function withinValidity(): number {
   const crl = parseCrl(crlDer);

@@ -26,6 +26,14 @@ export interface RevocationCrlEntry {
   nextUpdate?: string | null
   revokedCount?: number
   revokedSerials?: string[]
+  /**
+   * Why a non-`ok` CRL failed, e.g. `ETIMEDOUT`. Present in every published
+   * snapshot; this interface omitted it, so a fixture that modelled the real
+   * shape did not type-check while one that modelled the type would have
+   * silently diverged from the data. Declared from what the data contains —
+   * verified across all 27 published country snapshots.
+   */
+  error?: string
 }
 
 export interface RevocationSnapshot {
