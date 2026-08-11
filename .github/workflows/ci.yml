@@ -31,12 +31,18 @@ jobs:
       # a machine without it, because CI ran no tests at all until SOC-170 — and
       # they hard-fail rather than skip when the store is missing, which is why
       # the very first real CI run found them. `trust-store/` is gitignored.
+      #
+      # A plain clone rather than a second actions/checkout: that action failed
+      # here with `ENOENT: mkdir '<workspace>/trust-store'` against a workspace
+      # its own previous step had just created. The store is public, so no
+      # token is involved and a blobless sparse clone fetches only `countries/`.
       - name: Check out the trust store the did:pki tests resolve against
-        uses: actions/checkout@v4
-        with:
-          repository: Attestto-com/attestto-trust
-          path: trust-store
-          sparse-checkout: countries
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/Attestto-com/attestto-trust.git trust-store
+          git -C trust-store sparse-checkout set countries
+          test -d trust-store/countries || { echo "::error::trust store has no countries/"; exit 1; }
+          echo "countries: $(ls trust-store/countries | wc -l)"
 
       - uses: actions/setup-node@v4
         with:
