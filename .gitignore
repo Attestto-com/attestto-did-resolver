@@ -3,3 +3,5 @@ dist/
 *.tsbuildinfo
 .DS_Store
 trust-store/
+coverage/
+node_modules

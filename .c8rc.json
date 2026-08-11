@@ -1,0 +1,11 @@
+{
+  "all": true,
+  "src": ["src"],
+  "exclude": ["src/__tests__/**", "**/*.d.ts", "dist/**"],
+  "reporter": ["text-summary", "text", "lcov"],
+  "check-coverage": true,
+  "statements": 78,
+  "branches": 76,
+  "functions": 85,
+  "lines": 78
+}

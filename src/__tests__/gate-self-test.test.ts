@@ -57,6 +57,54 @@ describe('CI actually runs the tests', () => {
   })
 })
 
+describe('coverage is measured, with a floor that can fail', () => {
+  // Before this, coverage was not measured anywhere: no c8, no threshold, no
+  // report. "Is this tested?" could only be answered by grepping which modules
+  // a spec happens to import — which is how `server.ts` sat at zero coverage
+  // through six security commits without anyone noticing.
+  test('ci.yml runs the coverage check', () => {
+    assert.match(
+      ci,
+      /^\s*run:\s*npm run test:coverage\s*$/m,
+      'ci.yml no longer measures coverage — the floor stops applying silently',
+    )
+  })
+
+  test('.c8rc.json enforces the floor rather than only reporting', () => {
+    const c8 = JSON.parse(readFileSync(join(repoRoot, '.c8rc.json'), 'utf-8')) as {
+      'check-coverage'?: boolean
+      statements?: number
+      branches?: number
+      functions?: number
+      lines?: number
+    }
+    // Without `check-coverage`, c8 prints a table and exits 0 — a report, not
+    // a gate. This is the difference between the two.
+    assert.equal(c8['check-coverage'], true, 'coverage must fail the build, not just print')
+    for (const k of ['statements', 'branches', 'functions', 'lines'] as const) {
+      assert.ok((c8[k] ?? 0) > 0, `${k} has no floor`)
+    }
+  })
+
+  test('the floors are never lowered to make a build pass', () => {
+    // A ratchet. These are the values the suite measured when the gate went in
+    // (84.6 / 83.3 / 89.3 statements/branches/functions, floored a couple of
+    // points below). Raising them is the intended edit; lowering one is how a
+    // coverage gate quietly becomes decorative, so it reddens here first.
+    const c8 = JSON.parse(readFileSync(join(repoRoot, '.c8rc.json'), 'utf-8')) as Record<
+      string,
+      number
+    >
+    const FLOOR = { statements: 78, branches: 76, functions: 85, lines: 78 }
+    for (const [k, min] of Object.entries(FLOOR)) {
+      assert.ok(
+        c8[k] >= min,
+        `.c8rc.json ${k} was lowered to ${c8[k]}; the ratchet floor is ${min}`,
+      )
+    }
+  })
+})
+
 describe('the test script reaches every spec', () => {
   test('the glob is quoted, so node expands it recursively — not sh', () => {
     // `node --test src/**/*.test.ts` is expanded by sh, where `**` is NOT

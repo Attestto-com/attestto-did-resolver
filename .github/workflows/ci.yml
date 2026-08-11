@@ -65,5 +65,14 @@ jobs:
       - name: Test
         run: npm test
 
+      # Coverage was not measured at all, so "is this tested?" could only be
+      # answered by grepping which modules a spec imports. The floors in
+      # .c8rc.json are set just below what the suite measures TODAY, not at
+      # 100: a threshold nobody can meet gets deleted, and it takes the useful
+      # part with it. Raise them as coverage rises; never lower them to make a
+      # build pass.
+      - name: Coverage
+        run: npm run test:coverage
+
       - name: Build
         run: npm run build

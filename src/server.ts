@@ -18,7 +18,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { TrustRegistry } from './registry.js'
 import { DidPkiResolver } from './pki-resolver.js'
 import { DidSnsResolver } from './sns-resolver.js'
@@ -389,7 +389,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
 // ── Server ──────────────────────────────────────────────────────────
 
-const server = createServer(async (req, res) => {
+/**
+ * The request handler, exported so it can be tested.
+ *
+ * Every route in this file was previously unreachable from a test: the module
+ * exported nothing, called `server.listen()` at import, and fired a network
+ * refresh on the same tick. So the modules underneath were well covered while
+ * the WIRING — whether CORS headers are actually attached, whether the limiter
+ * actually runs before the resolve path, whether a degraded health check
+ * actually sends 503 — was asserted nowhere. That is the layer the defects in
+ * this epic lived in: `cors-whitelist.json` was never copied into the image,
+ * and no unit test could have noticed.
+ */
+export const requestHandler = async (req: IncomingMessage, res: ServerResponse) => {
   try {
     await handleRequest(req, res)
   } catch (error) {
@@ -402,26 +414,45 @@ const server = createServer(async (req, res) => {
       didDocumentMetadata: {},
     })
   }
-})
+}
 
-server.listen(PORT, () => {
-  log('info', `Attestto DID Resolver listening on port ${PORT}`, {
-    methods: ['did:pki', 'did:sns'],
-    pkiDids: state.meta.didCount,
+/**
+ * Bind the port and start the refresh timers.
+ *
+ * Split from module scope so importing this file has no side effects. It used
+ * to `listen()` and fire a network refresh on import, which is why nothing
+ * could import it — and therefore why no route was ever tested.
+ */
+export function start() {
+  const server = createServer(requestHandler)
+
+  server.listen(PORT, () => {
+    log('info', `Attestto DID Resolver listening on port ${PORT}`, {
+      methods: ['did:pki', 'did:sns'],
+      pkiDids: state.meta.didCount,
+    })
   })
-})
 
-// Pull the latest published trust data shortly after boot (non-blocking), then
-// on a fixed interval. Failures are logged and leave the baked snapshot in place.
-refreshManager.refresh('npm', 'startup')
-  .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Startup refresh: ${r.reason}`, { didCount: r.didCount }))
-  .catch((err) => log('warn', `[did:pki] Startup refresh threw: ${err instanceof Error ? err.message : err}`))
+  // Pull the latest published trust data shortly after boot (non-blocking), then
+  // on a fixed interval. Failures are logged and leave the baked snapshot in place.
+  refreshManager.refresh('npm', 'startup')
+    .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Startup refresh: ${r.reason}`, { didCount: r.didCount }))
+    .catch((err) => log('warn', `[did:pki] Startup refresh threw: ${err instanceof Error ? err.message : err}`))
 
-setInterval(() => {
-  refreshManager.refresh('npm', 'scheduled')
-    .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Scheduled refresh: ${r.reason}`, { didCount: r.didCount }))
-    .catch((err) => log('warn', `[did:pki] Scheduled refresh threw: ${err instanceof Error ? err.message : err}`))
-}, REFRESH_INTERVAL_MS).unref()
+  setInterval(() => {
+    refreshManager.refresh('npm', 'scheduled')
+      .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Scheduled refresh: ${r.reason}`, { didCount: r.didCount }))
+      .catch((err) => log('warn', `[did:pki] Scheduled refresh threw: ${err instanceof Error ? err.message : err}`))
+  }, REFRESH_INTERVAL_MS).unref()
 
-// Periodically drop expired rate-limit windows so the map stays bounded.
-setInterval(() => rateLimiter.prune(), Math.max(RATE_LIMIT_WINDOW_MS, 60_000)).unref()
+  // Periodically drop expired rate-limit windows so the map stays bounded.
+  setInterval(() => rateLimiter.prune(), Math.max(RATE_LIMIT_WINDOW_MS, 60_000)).unref()
+
+  return server
+}
+
+// Start only when run as the entrypoint — `node dist/server.js` (the Dockerfile
+// CMD) and `tsx src/server.ts` both satisfy this; an `import` does not.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  start()
+}
