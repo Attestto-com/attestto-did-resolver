@@ -59,7 +59,14 @@ jobs:
           )
           EXCLUDE="node_modules/\|/dist/\|__tests__/\|__mocks__/\|/demo/\|/scripts/\|/fixtures/\|\.test\.\|\.spec\.\|vitest\.\|jest\."
           INCLUDE='\.ts:\|\.tsx:\|\.vue:\|\.js:\|\.mjs:'
-          ALLOW='stub-guard-ignore\|/i18n/\|/locales/\|@example\|/\*\*\|^ *\*'
+          # The last alternative allows a JSDoc continuation line. It was
+          # written `^ *\*`, which could never match: these lines are grep -n
+          # output, so they start `path:lineno:` and the content begins after
+          # the second colon — never at column 0. The rule had no effect from
+          # the day it was written; it went unnoticed until a comment on the
+          # SNS stack needed it. Anchored on the prefix, it now works, and a
+          # planted `const CANARY = 'not implemented yet'` is still caught.
+          ALLOW='stub-guard-ignore\|/i18n/\|/locales/\|@example\|/\*\*\|^[^:]*:[0-9][0-9]*: *\*'
           HITS=0
           for pat in "${PATTERNS[@]}"; do
             matches=$(grep -rEn -i "$pat" src 2>/dev/null | grep "$INCLUDE" | grep -v "$EXCLUDE" | grep -v "$ALLOW" || true)
