@@ -1,10 +1,17 @@
 name: CI
 
+# SOC-170 put the tests behind a gate; this decides which pushes reach it.
+# `branches: [main]` meant a pull request into any other base ran nothing — so
+# the stacked SOC-175/176 work, whose base is another feature branch, would
+# have merged un-gated. The same hole was measured next door in
+# attestto-creds-extension: CI listened only for `develop` and 37 pushed
+# commits were never checked. A gate that covers only the last hop is not a
+# gate. `'**'` costs one runner per push and removes the exception.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
+    branches: ['**']
 
 jobs:
   build:

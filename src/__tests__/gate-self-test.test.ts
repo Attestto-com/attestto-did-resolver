@@ -47,6 +47,25 @@ describe('CI actually runs the tests', () => {
     )
   })
 
+  test('the gate listens on every branch, not just main', () => {
+    // The steps below are worthless on a branch CI never hears about. With
+    // `branches: [main]` a pull request whose base is another feature branch
+    // — the shape this stack ships in — ran no job at all, so every step
+    // asserted in this file was skipped rather than failed. Narrowing the
+    // trigger is the cheapest way to disable the whole suite without touching
+    // a single test, so the trigger is asserted alongside the steps.
+    const triggers = ci.slice(0, ci.search(/^jobs:/m))
+    const branchLines = triggers.match(/^\s*branches:.*$/gm) ?? []
+    assert.ok(branchLines.length >= 2, 'both push and pull_request must declare a branch filter')
+    for (const line of branchLines) {
+      assert.match(
+        line,
+        /\*\*/,
+        `CI would skip branches matching neither side of ${line.trim()} — stacked PRs merge un-gated`,
+      )
+    }
+  })
+
   test('the test step runs BEFORE the build step', () => {
     // A build that succeeds after a failed test is a wasted signal; ordering
     // makes the failure land on the cheapest step.
