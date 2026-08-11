@@ -20,6 +20,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `canonical-slug.test.ts` and `document-jwk.test.ts` load the REAL trust
+      # store and assert that EVERY DID the registry indexes resolves back to
+      # itself — the tripwire ATT-1070 slipped through. A toy fixture would make
+      # that assertion vacuous, so the tests look for a store instead of
+      # inlining one: first the sibling `../attestto-trust/countries` that a
+      # workstation has, then `trust-store/countries` here.
+      #
+      # Six of them passed only because of that sibling. They had never run on
+      # a machine without it, because CI ran no tests at all until SOC-170 — and
+      # they hard-fail rather than skip when the store is missing, which is why
+      # the very first real CI run found them. `trust-store/` is gitignored.
+      - name: Check out the trust store the did:pki tests resolve against
+        uses: actions/checkout@v4
+        with:
+          repository: Attestto-com/attestto-trust
+          path: trust-store
+          sparse-checkout: countries
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
