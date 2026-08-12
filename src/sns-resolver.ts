@@ -17,6 +17,7 @@
 import { Connection, PublicKey } from '@solana/web3.js'
 import { createHash } from 'node:crypto'
 import { parseSnsDid, type SnsNetwork } from './sns-parse.js'
+import { solanaAddressToMultibase } from './multibase.js'
 
 // ── SNS Constants ────────────────────────────────────────────────────────────
 
@@ -36,11 +37,14 @@ const NETWORK_ENDPOINTS: Record<string, string> = {
   testnet: 'https://api.testnet.solana.com',
 }
 
+// Only the contexts the document actually uses. secp256k1-2019 and x25519-2020
+// were declared while no method of either type was ever emitted — and after the
+// ECIES method was removed (SOC-174) secp256k1 became dead too. A declared
+// context is not free: every verifier dereferences it, and it injects terms
+// nobody audited into the document's vocabulary.
 const DID_CONTEXT = [
   'https://www.w3.org/ns/did/v1',
   'https://w3id.org/security/suites/ed25519-2020/v1',
-  'https://w3id.org/security/suites/secp256k1-2019/v1',
-  'https://w3id.org/security/suites/x25519-2020/v1',
 ]
 
 // ── DID Metadata (data buffer bytes 96+) ─────────────────────────────────────
@@ -97,8 +101,11 @@ interface VerificationMethod {
   id: string
   type: string
   controller: string
-  publicKeyBase58?: string
-  publicKeyMultibase?: string
+  // No `publicKeyBase58`. The term is undefined in the ed25519-2020 context
+  // this document declares, so a JSON-LD processor silently drops it and the
+  // method expands with no key material. Removing it from the type removes the
+  // way back in.
+  publicKeyMultibase: string
 }
 
 interface ServiceEndpoint {
@@ -290,6 +297,10 @@ export class DidSnsResolver {
           hasLei: domainData.didMetadata.hasLei,
           hasSas: domainData.didMetadata.hasSas,
           documentHash: domainData.didMetadata.documentHash,
+          // Raw hex from §10's buffer, asserting no key format. The document
+          // no longer carries an `#ecies-key` verification method (SOC-174),
+          // and dropping the method must not drop the datum.
+          eciesPublicKey: domainData.didMetadata.eciesPublicKey,
         }
       }
 
@@ -478,27 +489,50 @@ export class DidSnsResolver {
     const ownerKey = domainData.owner
     const meta = domainData.didMetadata
 
+    // ── §8.5 / §8.2 — the owner key ─────────────────────────────────────────
+    //
+    // `#solana-key` is §8.5's name for this method. `#key-1` appears nowhere in
+    // the spec; it was invented here. Renaming is cheap only while there are no
+    // signed artifacts, which is now.
+    //
+    // `publicKeyMultibase` is the encoding every §8.2/§8.3/§8.4 example uses,
+    // and the only one the `ed25519-2020` context declared in `@context`
+    // defines. Under `publicKeyBase58` a JSON-LD processor dropped the property
+    // and expanded this method with no key material at all, against §13's
+    // promise that "any JSON-LD processor can expand did:sns documents".
+    const OWNER_KEY_FRAGMENT = `${did}#solana-key`
+
     const verificationMethods: VerificationMethod[] = [
       {
-        id: `${did}#key-1`,
+        id: OWNER_KEY_FRAGMENT,
         type: 'Ed25519VerificationKey2020',
         controller: did,
-        publicKeyBase58: ownerKey,
+        publicKeyMultibase: solanaAddressToMultibase(ownerKey),
       },
     ]
 
-    const keyAgreement: string[] = []
-
-    // If on-chain metadata has an ECIES public key, add secp256k1 verification method
-    if (meta?.hasMetadata && meta.eciesPublicKey && meta.eciesPublicKey !== '0'.repeat(66)) {
-      verificationMethods.push({
-        id: `${did}#ecies-key`,
-        type: 'EcdsaSecp256k1VerificationKey2019',
-        controller: did,
-        publicKeyMultibase: `z${meta.eciesPublicKey}`,
-      })
-      keyAgreement.push(`${did}#ecies-key`)
-    }
+    // ── The ECIES key is NOT a verification method ──────────────────────────
+    //
+    // It used to be emitted as `#ecies-key`, typed
+    // `EcdsaSecp256k1VerificationKey2019` — a *signature* suite — inside
+    // `keyAgreement`, carrying `publicKeyMultibase: "z" + <66 hex chars>`. The
+    // `z` declares base58btc over a payload that is hex, so every conforming
+    // decoder either throws or yields unrelated bytes. Nothing could consume
+    // it, and nothing did: workspace-wide the only readers of this field
+    // (CORTEX's `verifier_service` and `did_sns_metadata_service`) parse it
+    // from the on-chain buffer directly, never from a resolved document.
+    //
+    // There is no correct shape to emit it under. §8.5 has no row for
+    // `#ecies-key`; §12.1's post-quantum table names the fragment but gives it
+    // no type and no encoding. Per Rule 0 the resolver does not choose one — a
+    // resolver that resolves a spec gap by picking a behaviour creates a second
+    // source of truth, which is exactly how `#key-1` came to exist. Raised as a
+    // spec gap under SOC-177.
+    //
+    // The value is not lost: it is reported in
+    // `didResolutionMetadata.snsMetadata.didMetadata.eciesPublicKey`, as raw
+    // hex, claiming nothing about a key format — the same treatment the vault
+    // hash gets below for the same reason.
 
     // ── §8.6 service endpoints ──────────────────────────────────────────
     //
@@ -540,13 +574,9 @@ export class DidSnsResolver {
       'id': did,
       'controller': [did],
       'verificationMethod': verificationMethods,
-      'authentication': [`${did}#key-1`],
-      'assertionMethod': [`${did}#key-1`],
+      'authentication': [OWNER_KEY_FRAGMENT],
+      'assertionMethod': [OWNER_KEY_FRAGMENT],
       ...(services.length > 0 ? { service: services } : {}),
-    }
-
-    if (keyAgreement.length > 0) {
-      doc.keyAgreement = keyAgreement
     }
 
     return doc
