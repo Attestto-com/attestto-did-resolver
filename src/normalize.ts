@@ -27,20 +27,20 @@ const COUNTRY_SUFFIXES = [
   'united states', 'deutschland', 'germany', 'france', 'italia', 'italy',
 ];
 
-const SEPARATOR_PATTERNS = [' - ', ' / ', ' – ', ' — '];
-
 /**
- * Known hierarchy level keywords that act as segment boundaries.
- * When these words appear at the start of a cleaned CN followed by a space,
- * they form their own segment.
+ * Country-name suffixes that are stripped from the END of a CN when they
+ * appear after a separator (e.g. "CA RAIZ NACIONAL - COSTA RICA" → "raiz-nacional").
+ * The separator forms in COUNTRY_SEP are the only place ` - ` / ` de ` etc. are
+ * treated as a boundary; ATT-1070 otherwise folds all punctuation into a single
+ * canonical CN segment (never emitting a stray trailing segment).
  */
-const LEVEL_KEYWORDS = ['politica'];
+const COUNTRY_SEP = [' - ', ' de ', ' of ', ' del ', ' – ', ' — '];
 
-/** Version suffix pattern: " v2", " v10", etc. at end of string */
-const VERSION_SUFFIX = /\s+v\d+$/i;
+/** Version suffix pattern: " v2", " v10", " - v2", etc. at end of string */
+const VERSION_SUFFIX = /\s*[-–—]?\s*v\d+$/i;
 
-/** Generation suffix pattern: " G2", " G3", etc. at end of string */
-const GENERATION_SUFFIX = /\s+g\d+$/i;
+/** Generation suffix pattern: " G2", " - G3", etc. at end of string */
+const GENERATION_SUFFIX = /\s*[-–—]?\s*g\d+$/i;
 
 /**
  * Organization names that represent the country PKI authority itself.
@@ -203,24 +203,31 @@ function removeOrgFromCN(cn: string, org: string): string {
 }
 
 /**
- * Normalize a CN value into path segments (after org has been extracted).
+ * Normalize a CN value into ca-path segments (after org has been extracted).
+ *
+ * ATT-1070 canonical slug rule: a CN produces AT MOST ONE path segment. Every
+ * run of non-`[a-z0-9]` characters (spaces, periods, dashes, slashes, parens,
+ * the various dash chars) collapses to a single hyphen. Version/generation
+ * tokens fold INTO the segment (`… persons - 2016` → `…-persons-2016`); they are
+ * NEVER emitted as their own trailing segment. Explicit `vN` / `GN` rotation
+ * markers are still stripped so key rotations of one CA identity share a DID
+ * (generation-grouping); year tokens and sub-CA discriminators (e.g. `2016`,
+ * `qca1`, `p1`, `001`) are kept because they name distinct CA identities.
+ *
+ * @returns At most one segment (empty array if the CN slugifies to nothing).
  */
 function processCN(cn: string): string[] {
   let value = cn;
 
-  // 1. Remove version suffix (e.g., " v2")
+  // 1. Strip explicit version/generation rotation suffixes (" v2", " - G3").
+  //    These mark key rotations of a single CA identity → shared DID.
   value = value.replace(VERSION_SUFFIX, '');
-
-  // 2. Remove generation suffix (e.g., " G2")
   value = value.replace(GENERATION_SUFFIX, '');
 
-  // 3. Transliterate to ASCII
-  value = transliterate(value);
+  // 2. Transliterate accents to ASCII, lowercase, trim.
+  value = transliterate(value).toLowerCase().trim();
 
-  // 4. Convert to lowercase
-  value = value.toLowerCase();
-
-  // 5. Remove CA prefixes
+  // 3. Remove leading CA prefixes ("ca ", "ac ").
   for (const prefix of CA_PREFIXES) {
     if (value.startsWith(prefix)) {
       value = value.slice(prefix.length);
@@ -228,37 +235,24 @@ function processCN(cn: string): string[] {
     }
   }
 
-  // 6. Remove country suffixes (with separator)
+  // 4. Remove trailing country-name suffixes ("… - COSTA RICA", "… de espana").
   for (const country of COUNTRY_SUFFIXES) {
-    for (const sep of [' - ', ' de ', ' of ', ' del ']) {
+    let stripped = false;
+    for (const sep of COUNTRY_SEP) {
       const suffix = sep + country;
       if (value.endsWith(suffix)) {
         value = value.slice(0, -suffix.length);
+        stripped = true;
         break;
       }
     }
+    if (stripped) break;
   }
 
-  // 7. Split on hierarchy level keywords
-  for (const kw of LEVEL_KEYWORDS) {
-    if (value.startsWith(kw + ' ')) {
-      value = kw + ' - ' + value.slice(kw.length + 1);
-      break;
-    }
-  }
-
-  // 8. Split on known separators
-  let segments: string[] = [value];
-  for (const sep of SEPARATOR_PATTERNS) {
-    segments = segments.flatMap(s => s.split(sep));
-  }
-
-  // 9. Normalize each segment: whitespace → hyphen, strip non-idchar, clean up
-  return segments
-    .map(s => s.trim())
-    .filter(s => s.length > 0)
-    .map(slugify)
-    .filter(s => s.length > 0);
+  // 5. Canonical slug: collapse ALL non-idchar runs to a single hyphen. Every
+  //    remaining discriminator (year, sub-CA index) folds into this ONE segment.
+  const segment = slugify(value);
+  return segment ? [segment] : [];
 }
 
 /**

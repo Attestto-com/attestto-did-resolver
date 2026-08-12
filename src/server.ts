@@ -25,12 +25,20 @@ import { DidSnsResolver } from './sns-resolver.js'
 import { CrlRevocationService } from './crl-revocation.js'
 import { RefreshManager, type TrustState } from './trust-refresh.js'
 import { checkBearer } from './admin-auth.js'
-import { readBodyCapped } from './http-utils.js'
+import { readBodyCapped, clientIp } from './http-utils.js'
+import { RateLimiter } from './rate-limit.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
 const TRUST_STORE = process.env.TRUST_STORE_PATH ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'trust-store', 'countries')
 const REFRESH_SECRET = process.env.REFRESH_SECRET
+
+// ── Rate limiting ───────────────────────────────────────────────────
+// Per-client-IP throttle for the public, unauthenticated surface. Defaults to
+// 1 request per 5s per IP; /health and / (status) are exempt (see handleRequest).
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 1)
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 5000)
+const rateLimiter = new RateLimiter({ windowMs: RATE_LIMIT_WINDOW_MS, maxRequests: RATE_LIMIT_MAX })
 
 // ── Initialize resolvers ────────────────────────────────────────────
 
@@ -146,6 +154,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         didCount: state.meta.didCount,
         lastRefreshAt: state.meta.lastRefreshAt,
       },
+    })
+    return
+  }
+
+  // Rate limit — per client IP, 1 req / 5s by default. /health and / returned
+  // above and are exempt so uptime checks and Fly health probes are never throttled.
+  const ip = clientIp(req)
+  const limit = rateLimiter.check(ip)
+  if (!limit.allowed) {
+    log('warn', 'Rate limited', { ip, path: url.pathname, retryAfterSec: limit.retryAfterSec })
+    res.setHeader('Retry-After', String(limit.retryAfterSec))
+    sendPlainJson(res, 429, {
+      error: 'rateLimited',
+      message: `Too many requests. Retry after ${limit.retryAfterSec}s.`,
+      retryAfterSec: limit.retryAfterSec,
     })
     return
   }
@@ -281,9 +304,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
     const duration = Date.now() - startTime
     const hasError = result.didResolutionMetadata?.error
-    const status = hasError
-      ? (hasError === 'notFound' ? 404 : hasError === 'invalidDid' ? 400 : 500)
-      : 200
+
+    // A transient failure (cert couldn't be parsed, upstream RPC hiccup) surfaces
+    // as `internalError`. Unlike notFound/invalidDid — which are the caller's
+    // fault and permanent — this is worth an immediate retry. Mirror the way
+    // transient TLS/SSL errors are retried: hand back the rate-limit token so the
+    // retry isn't throttled, keep the W3C resolution shape (200, null document),
+    // flag it retriable, and tell the caller to retry now (Retry-After: 0).
+    if (hasError === 'internalError') {
+      rateLimiter.refund(ip)
+      log('warn', 'Resolution transient error — inviting immediate retry', { did, duration, ip })
+      result.didResolutionMetadata = { ...result.didResolutionMetadata, retriable: true }
+      res.setHeader('Retry-After', '0')
+      sendJson(res, 200, result)
+      return
+    }
+
+    const status = hasError ? (hasError === 'notFound' ? 404 : hasError === 'invalidDid' ? 400 : 500) : 200
 
     log(
       hasError ? 'warn' : 'info',
@@ -339,3 +376,6 @@ setInterval(() => {
     .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Scheduled refresh: ${r.reason}`, { didCount: r.didCount }))
     .catch((err) => log('warn', `[did:pki] Scheduled refresh threw: ${err instanceof Error ? err.message : err}`))
 }, REFRESH_INTERVAL_MS).unref()
+
+// Periodically drop expired rate-limit windows so the map stays bounded.
+setInterval(() => rateLimiter.prune(), Math.max(RATE_LIMIT_WINDOW_MS, 60_000)).unref()
