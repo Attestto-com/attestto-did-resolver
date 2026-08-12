@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `canonical-slug.test.ts` and `document-jwk.test.ts` load the REAL trust
       # store and assert that EVERY DID the registry indexes resolves back to
@@ -44,7 +44,7 @@ jobs:
           test -d trust-store/countries || { echo "::error::trust store has no countries/"; exit 1; }
           echo "countries: $(ls trust-store/countries | wc -l)"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
