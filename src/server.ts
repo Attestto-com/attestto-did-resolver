@@ -31,6 +31,7 @@ import { loadAllowedOrigins, corsHeadersFor } from './cors.js'
 import { statusForResolution, resolutionError } from './resolution.js'
 import { parseDidUrl } from './parser.js'
 import { healthReport } from './health.js'
+import { verifyPresentation } from './vp-verify.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
@@ -294,6 +295,68 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Webhook refresh: ${r.reason}`, { didCount: r.didCount }))
       .catch((err) => log('warn', `[did:pki] Webhook refresh threw: ${err instanceof Error ? err.message : err}`))
     sendPlainJson(res, 202, { accepted: true, source })
+    return
+  }
+
+  // Presentation verification. POST /1.0/verify
+  //   { verifiablePresentation, expectedChallenge, expectedDomain } → { valid, holder, errors }
+  //
+  // SOC-181: `@attestto/id-wallet-adapter` has posted here since it was written
+  // and this route did not exist, so every DID login failed closed against
+  // the 404 handler. The contract it states is in `id-wallet-adapter/src/verify.ts:277`.
+  //
+  // The route sits AFTER the rate limiter deliberately — it does public-key
+  // work per request, so it is the most expensive unauthenticated surface on
+  // this server and the one that least deserves an exemption.
+  if (url.pathname === '/1.0/verify') {
+    if (method !== 'POST') {
+      res.setHeader('Allow', 'POST, OPTIONS')
+      sendPlainJson(res, 405, { error: 'methodNotAllowed', message: 'POST a presentation to /1.0/verify' })
+      return
+    }
+    let body: unknown
+    try {
+      // A presentation carries whole credentials, so the cap is larger than
+      // /admin/refresh's 4 KiB. It is still a cap: parsing is the first thing
+      // an unauthenticated caller can make this process do.
+      const raw = await readBodyCapped(req, 256 * 1024)
+      body = JSON.parse(raw.toString('utf-8'))
+    } catch (error) {
+      if (error instanceof RangeError) {
+        sendPlainJson(res, 413, { error: 'payloadTooLarge', message: 'Presentation exceeds 256 KiB' })
+        return
+      }
+      sendPlainJson(res, 400, { valid: false, holder: null, errors: [{ code: 'invalidRequest', message: 'Body is not valid JSON' }] })
+      return
+    }
+
+    // The verifier reads the document generically (DID Core property names),
+    // so it takes a plain object rather than either method's document type —
+    // one verifier, both methods, no branch that can drift per method.
+    const asDocument = (doc: unknown): Record<string, unknown> | null =>
+      (doc as Record<string, unknown> | null | undefined) ?? null
+
+    const result = await verifyPresentation(body, async (did) => {
+      if (did.startsWith('did:pki:')) return asDocument(state.pkiResolver.resolve(did).didDocument)
+      if (did.startsWith('did:sns:')) return asDocument((await snsResolver.resolve(did)).didDocument)
+      // Any other method is not resolvable by this server, so we cannot say
+      // whose key signed. Returning null makes that a verification failure
+      // rather than an exception.
+      return null
+    })
+
+    log(result.valid ? 'info' : 'warn', 'Presentation verification', {
+      holder: result.holder,
+      valid: result.valid,
+      // The code, never the message: messages name the expected values.
+      error: result.errors[0]?.code,
+    })
+
+    // 200 with `valid: false` — the request was well-formed and the answer is
+    // no. The adapter reads `res.ok` before the body, so answering 4xx for a
+    // failed verification would be indistinguishable from the missing route
+    // this ticket exists to fix.
+    sendPlainJson(res, 200, result)
     return
   }
 

@@ -19,9 +19,43 @@ Conforms to the [DIF Universal Resolver HTTP API](https://github.com/decentraliz
 GET /1.0/identifiers/{did}    → W3C DID Resolution Result
 GET /1.0/identifiers          → List resolvable did:pki DIDs
 GET /1.0/properties            → Driver metadata (DIF convention)
+POST /1.0/verify               → Verify a Verifiable Presentation (see below)
 GET /revocation/cr/{ca}        → CR Firma Digital (SINPE) CRL revocation status (JSON, CORS)
 GET /health                    → Health check
 ```
+
+### Presentation verification (`POST /1.0/verify`)
+
+Answers one question: is this presentation cryptographically bound to the key its proof
+names, in the holder's own DID Document, over this challenge and this domain.
+
+```json
+{ "verifiablePresentation": { … }, "expectedChallenge": "…", "expectedDomain": "https://…" }
+```
+
+Always `200` when the request is well-formed; the answer is in the body:
+
+```json
+{ "valid": false, "holder": "did:sns:alice.crbank", "errors": [{ "code": "challengeUnbound", "message": "…" }] }
+```
+
+The challenge and domain are checked against the **signed** claims (`nonce` and `aud` in
+the JWS payload), never against the `challenge` / `domain` fields sitting in the clear
+beside the signature. Those are unsigned: anyone holding a captured presentation can
+rewrite them to whatever a verifier asks for. A verifier that checked the signature and
+then read `proof.challenge` would accept replayed presentations while looking correct,
+which is why callers must not treat their own local comparison as sufficient. The signed
+envelope is also compared against the one that arrived, so a valid proof cannot be
+re-served around different credentials.
+
+The signature algorithm is taken from the key resolved out of the DID Document, never from
+the JWS header, so `alg: none` and HMAC-with-the-public-key are structurally impossible.
+The key must be listed under `authentication`: being written down in `verificationMethod`
+is not authorization to log in.
+
+**Scope.** `valid: true` says nothing about the credentials inside the presentation.
+Issuer trust, revocation and schema are the caller's, and `@attestto/id-wallet-adapter`
+does them itself.
 
 ### Revocation endpoint (`GET /revocation/cr/{ca}`)
 

@@ -19,8 +19,10 @@
     "tar": "^7.5.22"
   },
   "devDependencies": {
+    "@attestto/id-wallet-adapter": "^0.7.0",
     "@types/node": "^22.0.0",
     "c8": "^12.0.0",
+    "jose": "^6.2.8",
     "jsonld": "^8.3.3",
     "tsx": "^4.23.11",
     "typescript": "^5.6.0"
