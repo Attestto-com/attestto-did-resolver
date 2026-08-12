@@ -1,10 +1,17 @@
 name: CI
 
+# SOC-170 put the tests behind a gate; this decides which pushes reach it.
+# `branches: [main]` meant a pull request into any other base ran nothing — so
+# the stacked SOC-175/176 work, whose base is another feature branch, would
+# have merged un-gated. The same hole was measured next door in
+# attestto-creds-extension: CI listened only for `develop` and 37 pushed
+# commits were never checked. A gate that covers only the last hop is not a
+# gate. `'**'` costs one runner per push and removes the exception.
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
+    branches: ['**']
 
 jobs:
   build:
@@ -12,6 +19,30 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # `canonical-slug.test.ts` and `document-jwk.test.ts` load the REAL trust
+      # store and assert that EVERY DID the registry indexes resolves back to
+      # itself — the tripwire ATT-1070 slipped through. A toy fixture would make
+      # that assertion vacuous, so the tests look for a store instead of
+      # inlining one: first the sibling `../attestto-trust/countries` that a
+      # workstation has, then `trust-store/countries` here.
+      #
+      # Six of them passed only because of that sibling. They had never run on
+      # a machine without it, because CI ran no tests at all until SOC-170 — and
+      # they hard-fail rather than skip when the store is missing, which is why
+      # the very first real CI run found them. `trust-store/` is gitignored.
+      #
+      # A plain clone rather than a second actions/checkout: that action failed
+      # here with `ENOENT: mkdir '<workspace>/trust-store'` against a workspace
+      # its own previous step had just created. The store is public, so no
+      # token is involved and a blobless sparse clone fetches only `countries/`.
+      - name: Check out the trust store the did:pki tests resolve against
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/Attestto-com/attestto-trust.git trust-store
+          git -C trust-store sparse-checkout set countries
+          test -d trust-store/countries || { echo "::error::trust store has no countries/"; exit 1; }
+          echo "countries: $(ls trust-store/countries | wc -l)"
 
       - uses: actions/setup-node@v4
         with:
@@ -34,7 +65,14 @@ jobs:
           )
           EXCLUDE="node_modules/\|/dist/\|__tests__/\|__mocks__/\|/demo/\|/scripts/\|/fixtures/\|\.test\.\|\.spec\.\|vitest\.\|jest\."
           INCLUDE='\.ts:\|\.tsx:\|\.vue:\|\.js:\|\.mjs:'
-          ALLOW='stub-guard-ignore\|/i18n/\|/locales/\|@example\|/\*\*\|^ *\*'
+          # The last alternative allows a JSDoc continuation line. It was
+          # written `^ *\*`, which could never match: these lines are grep -n
+          # output, so they start `path:lineno:` and the content begins after
+          # the second colon — never at column 0. The rule had no effect from
+          # the day it was written; it went unnoticed until a comment on the
+          # SNS stack needed it. Anchored on the prefix, it now works, and a
+          # planted `const CANARY = 'not implemented yet'` is still caught.
+          ALLOW='stub-guard-ignore\|/i18n/\|/locales/\|@example\|/\*\*\|^[^:]*:[0-9][0-9]*: *\*'
           HITS=0
           for pat in "${PATTERNS[@]}"; do
             matches=$(grep -rEn -i "$pat" src 2>/dev/null | grep "$INCLUDE" | grep -v "$EXCLUDE" | grep -v "$ALLOW" || true)
@@ -49,8 +87,30 @@ jobs:
           fi
           echo "Stub guard passed"
 
-      - name: Type check
+      - name: Type check (sources)
         run: npx tsc --noEmit
+
+      # `tsconfig.json` excludes tests so `npm run build` does not emit them
+      # into dist/. Without this second pass no spec is ever type-checked —
+      # measured: `tsc --noEmit --listFiles | grep -c __tests__` was 0.
+      - name: Type check (tests)
+        run: npx tsc --noEmit -p tsconfig.test.json
+
+      # This step is the point of SOC-170. Nine test suites existed and CI ran
+      # none of them, so seven spec violations reached a public endpoint. A
+      # pipeline that builds without testing signals a confidence nobody
+      # earned. If this step is ever removed, gate-self-test.test.ts goes red.
+      - name: Test
+        run: npm test
+
+      # Coverage was not measured at all, so "is this tested?" could only be
+      # answered by grepping which modules a spec imports. The floors in
+      # .c8rc.json are set just below what the suite measures TODAY, not at
+      # 100: a threshold nobody can meet gets deleted, and it takes the useful
+      # part with it. Raise them as coverage rises; never lower them to make a
+      # build pass.
+      - name: Coverage
+        run: npm run test:coverage
 
       - name: Build
         run: npm run build

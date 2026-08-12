@@ -9,6 +9,7 @@ import type {
   PkiMetadata,
 } from './types.js';
 import { getCountryConfig } from './countries.js';
+import type { RevocationLookup } from './revocation-store.js';
 
 /**
  * Minimal DER TLV reader — returns the tag, the content offset, and the end
@@ -147,15 +148,42 @@ function extractServiceEndpoints(pem: string, did: string): ServiceEndpoint[] {
 }
 
 /**
- * Determine the generation status based on validity dates.
+ * Where a certificate sits in its own validity window.
+ *
+ * This deliberately CANNOT return `'revoked'`. Nothing in `did:pki` resolution
+ * consults a revocation source, and a status the resolver never determines must
+ * not be a value it can emit — `attestto-verify` branches over
+ * `'active' | 'revoked' | 'expired'`, and that middle branch has never been
+ * reachable. Narrowing the return type is what stops a future edit from
+ * quietly reintroducing an unchecked claim.
+ *
+ * Two changes from the previous version:
+ *
+ *   - a certificate whose `notBefore` is in the future returned `'active'`,
+ *     with a comment conceding it was "not yet valid but still active in
+ *     registry". A CA that cannot yet sign is not in service, and a verifier
+ *     had no way to tell it from one that is.
+ *   - an unparseable date fell through to `'active'`. Every comparison against
+ *     an Invalid Date is false, so the guard chain simply missed — and the one
+ *     certificate whose dates cannot be read is the one that must never read
+ *     as in-service.
+ *
+ * `now` is a parameter so the result is a function of its inputs.
  */
-function getGenerationStatus(validFrom: string, validTo: string): 'active' | 'expired' {
-  const now = new Date();
-  const notAfter = new Date(validTo);
-  const notBefore = new Date(validFrom);
+export type GenerationStatus = 'active' | 'expired' | 'not-yet-valid' | 'unknown';
 
-  if (now > notAfter) return 'expired';
-  if (now < notBefore) return 'active'; // not yet valid but still "active" in registry
+export function getGenerationStatus(
+  validFrom: string,
+  validTo: string,
+  now: Date = new Date()
+): GenerationStatus {
+  const notBefore = new Date(validFrom);
+  const notAfter = new Date(validTo);
+
+  if (Number.isNaN(notBefore.getTime()) || Number.isNaN(notAfter.getTime())) return 'unknown';
+
+  if (now.getTime() > notAfter.getTime()) return 'expired';
+  if (now.getTime() < notBefore.getTime()) return 'not-yet-valid';
   return 'active';
 }
 
@@ -168,6 +196,13 @@ function getGenerationStatus(validFrom: string, validTo: string): 'active' | 'ex
 export function buildDidDocument(
   entries: RegistryEntry[],
   pemContents: Map<string, string>,
+  /**
+   * Consulted per certificate against the CRL its own CRL Distribution Point
+   * names. Optional: when absent, every generation reports
+   * `revocationChecked: false` — which is the honest answer, and was the only
+   * answer this function could give before.
+   */
+  revocation?: RevocationLookup,
 ): { document: DidDocument; metadata: DidDocumentMetadata } {
   if (entries.length === 0) {
     throw new Error('No entries provided');
@@ -208,7 +243,17 @@ export function buildDidDocument(
 
     assertionMethods.push(vmId);
 
-    const status = getGenerationStatus(entry.cert.validFrom, entry.cert.validTo);
+    let status: GenerationStatus | 'revoked' = getGenerationStatus(
+      entry.cert.validFrom,
+      entry.cert.validTo
+    );
+
+    // Revocation outranks the validity window: a revoked certificate is revoked
+    // whether or not it has also expired, and a verifier needs to know which.
+    const verdict = revocation
+      ? revocation.check(entry.cert.serialNumber, entry.cert.crlUrls)
+      : { checked: false, revoked: false };
+    if (verdict.revoked) status = 'revoked';
 
     generations.push({
       keyId,
@@ -218,6 +263,11 @@ export function buildDidDocument(
       fingerprint: sha256Fingerprint,
       fingerprintAlgorithm: 'sha-256',
       status,
+      // Stated, not implied. `false` means UNKNOWN — a root with no CRL
+      // Distribution Point, a CDP that did not respond, or a CRL past its own
+      // nextUpdate, whose silence carries no information. A consumer that
+      // requires revocation assurance must never read it as "good".
+      revocationChecked: verdict.checked,
     });
 
     // Extract services from first generation only (they're usually the same)
@@ -278,7 +328,12 @@ export function buildDidDocument(
   const allNotAfter = entries.map(e => new Date(e.cert.validTo).getTime());
   const nextUpdate = new Date(Math.min(...allNotAfter)).toISOString();
 
-  const allDeactivated = generations.every(g => g.status === 'expired' || g.status === 'revoked');
+  // A DID is deactivated when every generation has EXPIRED. `not-yet-valid` is
+  // the opposite of deactivated, and `unknown` is an absence of information —
+  // neither may be read as retirement. `revoked` stays in the test because a
+  // future revocation-aware build should count it, but nothing emits it today.
+  const allDeactivated =
+    generations.length > 0 && generations.every(g => g.status === 'expired' || g.status === 'revoked');
 
   // versionId = SHA-256 of concatenated fingerprints
   const fingerprintsConcat = generations.map(g => g.fingerprint).sort().join('');

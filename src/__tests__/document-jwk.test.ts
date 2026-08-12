@@ -43,7 +43,7 @@ test('JWK fallback: EVERY registry DID resolves (no internalError)', () => {
   for (const did of resolver.listDids()) {
     const res = resolver.resolve(did);
     if (!res.didDocument) {
-      failures.push(`${did} :: ${res.didResolutionMetadata.error} ${res.didResolutionMetadata.message ?? ''}`);
+      failures.push(`${did} :: ${res.didResolutionMetadata.error} ${res.didResolutionMetadata.errorMessage ?? ''}`);
     }
   }
   assert.deepEqual(
@@ -64,7 +64,7 @@ test('JWK fallback: RSA-PSS cert yields a re-importable RSA JWK', () => {
   const resolver = new DidPkiResolver(registry);
 
   const res = resolver.resolve('did:pki:de:atos-information-technology:hba-qca1');
-  assert.ok(res.didDocument, `did not resolve: ${res.didResolutionMetadata.message}`);
+  assert.ok(res.didDocument, `did not resolve: ${res.didResolutionMetadata.errorMessage}`);
 
   const jwk = res.didDocument!.verificationMethod[0].publicKeyJwk;
   assert.equal(jwk.kty, 'RSA');
@@ -72,7 +72,7 @@ test('JWK fallback: RSA-PSS cert yields a re-importable RSA JWK', () => {
   assert.ok(jwk.e && B64URL.test(jwk.e), 'exponent is not base64url');
   // The hand-built JWK must re-import as a valid RSA key (proves n/e correct).
   const { 'x5t#S256': _t, ...pure } = jwk;
-  const key = createPublicKey({ key: pure as JsonWebKey, format: 'jwk' });
+  const key = createPublicKey({ key: pure as unknown as import('node:crypto').JsonWebKey, format: 'jwk' });
   assert.equal(key.asymmetricKeyType, 'rsa');
   assert.equal(key.asymmetricKeyDetails?.modulusLength, 2048);
 });
@@ -88,7 +88,7 @@ test('JWK fallback: brainpool EC cert yields EC JWK with curve name + x/y', () =
   const resolver = new DidPkiResolver(registry);
 
   const res = resolver.resolve('did:pki:de:atos-information-technology:hba-qca2');
-  assert.ok(res.didDocument, `did not resolve: ${res.didResolutionMetadata.message}`);
+  assert.ok(res.didDocument, `did not resolve: ${res.didResolutionMetadata.errorMessage}`);
 
   const jwk = res.didDocument!.verificationMethod[0].publicKeyJwk;
   assert.equal(jwk.kty, 'EC');
