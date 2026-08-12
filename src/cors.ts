@@ -84,7 +84,11 @@ export function corsHeadersFor(
 
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    // POST is here for `/1.0/verify` (SOC-181), which a browser reaches through
+    // `<attestto-login>`. Without it the preflight fails and the login button
+    // is dead from the browser while working from curl — a failure mode that
+    // looks like the endpoint rather than the header.
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Accept',
     'Access-Control-Max-Age': '86400',
     // The response body varies by Origin, so a shared cache must key on it.
