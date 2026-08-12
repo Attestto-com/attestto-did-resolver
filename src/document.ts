@@ -1,4 +1,4 @@
-import { createHash, X509Certificate } from 'node:crypto';
+import { createHash, X509Certificate, type KeyObject } from 'node:crypto';
 import type {
   RegistryEntry,
   DidDocument,
@@ -9,13 +9,99 @@ import type {
   PkiMetadata,
 } from './types.js';
 import { getCountryConfig } from './countries.js';
+import type { RevocationLookup } from './revocation-store.js';
+
+/**
+ * Minimal DER TLV reader — returns the tag, the content offset, and the end
+ * offset of one ASN.1 element. Only definite-length encodings occur in SPKI.
+ */
+function readTLV(
+  buf: Buffer,
+  off: number,
+): { tag: number; contentOff: number; end: number } {
+  const tag = buf[off++];
+  let len = buf[off++];
+  if (len & 0x80) {
+    const n = len & 0x7f;
+    len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | buf[off++];
+  }
+  return { tag, contentOff: off, end: off + len };
+}
+
+const b64url = (b: Buffer): string => Buffer.from(b).toString('base64url');
+
+/**
+ * Build a JWK by hand from a SubjectPublicKeyInfo (SPKI) DER buffer.
+ *
+ * Node's native `KeyObject.export({ format: 'jwk' })` refuses two key classes
+ * that appear in real national PKIs (notably the German HBA/qCA CAs):
+ *   - RSA-PSS keys ("Unsupported JWK Key Type") — the key is ordinary RSA, only
+ *     the algorithm OID (id-RSASSA-PSS) differs, so we read n/e from the SPKI.
+ *   - EC keys on brainpool curves ("Unsupported JWK EC curve") — JWK has no
+ *     registered `crv` name, so we emit the OpenSSL curve name (e.g.
+ *     "brainpoolP256r1") and the raw x/y coordinates.
+ *
+ * SPKI = SEQ { SEQ { algOID, params }, BIT STRING subjectPublicKey }.
+ */
+function spkiToJwk(key: KeyObject): JsonWebKey {
+  const der = key.export({ type: 'spki', format: 'der' }) as Buffer;
+
+  // outer SEQUENCE → AlgorithmIdentifier SEQUENCE → BIT STRING
+  const outer = readTLV(der, 0);
+  const algId = readTLV(der, outer.contentOff);
+  const bitStr = readTLV(der, algId.end);
+  // BIT STRING content starts with an "unused bits" byte (always 0 here).
+  const spk = der.subarray(bitStr.contentOff + 1, bitStr.end);
+
+  const keyType = key.asymmetricKeyType;
+
+  if (keyType === 'rsa' || keyType === 'rsa-pss') {
+    // subjectPublicKey wraps RSAPublicKey ::= SEQ { modulus INTEGER, exponent INTEGER }
+    const rsaSeq = readTLV(spk, 0);
+    const nTlv = readTLV(spk, rsaSeq.contentOff);
+    let n = spk.subarray(nTlv.contentOff, nTlv.end);
+    const eTlv = readTLV(spk, nTlv.end);
+    const e = spk.subarray(eTlv.contentOff, eTlv.end);
+    // INTEGERs are signed → drop a leading 0x00 padding byte from the modulus.
+    if (n[0] === 0x00) n = n.subarray(1);
+    return { kty: 'RSA', n: b64url(n), e: b64url(e) };
+  }
+
+  if (keyType === 'ec') {
+    // subjectPublicKey = 0x04 || X || Y (uncompressed point).
+    const curve = key.asymmetricKeyDetails?.namedCurve;
+    if (!curve || spk[0] !== 0x04) {
+      throw new Error(`Unsupported EC public key encoding (curve: ${curve ?? 'unknown'})`);
+    }
+    const coord = spk.subarray(1);
+    const half = coord.length / 2;
+    return {
+      kty: 'EC',
+      crv: curve,
+      x: b64url(coord.subarray(0, half)),
+      y: b64url(coord.subarray(half)),
+    };
+  }
+
+  throw new Error(`Unsupported key type for JWK export: ${keyType}`);
+}
 
 /**
  * Extract a JWK public key from a PEM-encoded X.509 certificate.
+ *
+ * Uses Node's native JWK export for the common cases and falls back to a
+ * hand-rolled SPKI parse for RSA-PSS and brainpool-EC keys that Node refuses
+ * to export (see spkiToJwk).
  */
 function extractJwk(pem: string): JsonWebKey {
   const x509 = new X509Certificate(pem);
-  return x509.publicKey.export({ format: 'jwk' }) as JsonWebKey;
+  const key = x509.publicKey;
+  try {
+    return key.export({ format: 'jwk' }) as JsonWebKey;
+  } catch {
+    return spkiToJwk(key);
+  }
 }
 
 /**
@@ -62,15 +148,42 @@ function extractServiceEndpoints(pem: string, did: string): ServiceEndpoint[] {
 }
 
 /**
- * Determine the generation status based on validity dates.
+ * Where a certificate sits in its own validity window.
+ *
+ * This deliberately CANNOT return `'revoked'`. Nothing in `did:pki` resolution
+ * consults a revocation source, and a status the resolver never determines must
+ * not be a value it can emit — `attestto-verify` branches over
+ * `'active' | 'revoked' | 'expired'`, and that middle branch has never been
+ * reachable. Narrowing the return type is what stops a future edit from
+ * quietly reintroducing an unchecked claim.
+ *
+ * Two changes from the previous version:
+ *
+ *   - a certificate whose `notBefore` is in the future returned `'active'`,
+ *     with a comment conceding it was "not yet valid but still active in
+ *     registry". A CA that cannot yet sign is not in service, and a verifier
+ *     had no way to tell it from one that is.
+ *   - an unparseable date fell through to `'active'`. Every comparison against
+ *     an Invalid Date is false, so the guard chain simply missed — and the one
+ *     certificate whose dates cannot be read is the one that must never read
+ *     as in-service.
+ *
+ * `now` is a parameter so the result is a function of its inputs.
  */
-function getGenerationStatus(validFrom: string, validTo: string): 'active' | 'expired' {
-  const now = new Date();
-  const notAfter = new Date(validTo);
-  const notBefore = new Date(validFrom);
+export type GenerationStatus = 'active' | 'expired' | 'not-yet-valid' | 'unknown';
 
-  if (now > notAfter) return 'expired';
-  if (now < notBefore) return 'active'; // not yet valid but still "active" in registry
+export function getGenerationStatus(
+  validFrom: string,
+  validTo: string,
+  now: Date = new Date()
+): GenerationStatus {
+  const notBefore = new Date(validFrom);
+  const notAfter = new Date(validTo);
+
+  if (Number.isNaN(notBefore.getTime()) || Number.isNaN(notAfter.getTime())) return 'unknown';
+
+  if (now.getTime() > notAfter.getTime()) return 'expired';
+  if (now.getTime() < notBefore.getTime()) return 'not-yet-valid';
   return 'active';
 }
 
@@ -83,6 +196,13 @@ function getGenerationStatus(validFrom: string, validTo: string): 'active' | 'ex
 export function buildDidDocument(
   entries: RegistryEntry[],
   pemContents: Map<string, string>,
+  /**
+   * Consulted per certificate against the CRL its own CRL Distribution Point
+   * names. Optional: when absent, every generation reports
+   * `revocationChecked: false` — which is the honest answer, and was the only
+   * answer this function could give before.
+   */
+  revocation?: RevocationLookup,
 ): { document: DidDocument; metadata: DidDocumentMetadata } {
   if (entries.length === 0) {
     throw new Error('No entries provided');
@@ -123,7 +243,17 @@ export function buildDidDocument(
 
     assertionMethods.push(vmId);
 
-    const status = getGenerationStatus(entry.cert.validFrom, entry.cert.validTo);
+    let status: GenerationStatus | 'revoked' = getGenerationStatus(
+      entry.cert.validFrom,
+      entry.cert.validTo
+    );
+
+    // Revocation outranks the validity window: a revoked certificate is revoked
+    // whether or not it has also expired, and a verifier needs to know which.
+    const verdict = revocation
+      ? revocation.check(entry.cert.serialNumber, entry.cert.crlUrls)
+      : { checked: false, revoked: false };
+    if (verdict.revoked) status = 'revoked';
 
     generations.push({
       keyId,
@@ -133,6 +263,11 @@ export function buildDidDocument(
       fingerprint: sha256Fingerprint,
       fingerprintAlgorithm: 'sha-256',
       status,
+      // Stated, not implied. `false` means UNKNOWN — a root with no CRL
+      // Distribution Point, a CDP that did not respond, or a CRL past its own
+      // nextUpdate, whose silence carries no information. A consumer that
+      // requires revocation assurance must never read it as "good".
+      revocationChecked: verdict.checked,
     });
 
     // Extract services from first generation only (they're usually the same)
@@ -193,7 +328,12 @@ export function buildDidDocument(
   const allNotAfter = entries.map(e => new Date(e.cert.validTo).getTime());
   const nextUpdate = new Date(Math.min(...allNotAfter)).toISOString();
 
-  const allDeactivated = generations.every(g => g.status === 'expired' || g.status === 'revoked');
+  // A DID is deactivated when every generation has EXPIRED. `not-yet-valid` is
+  // the opposite of deactivated, and `unknown` is an absence of information —
+  // neither may be read as retirement. `revoked` stays in the test because a
+  // future revocation-aware build should count it, but nothing emits it today.
+  const allDeactivated =
+    generations.length > 0 && generations.every(g => g.status === 'expired' || g.status === 'revoked');
 
   // versionId = SHA-256 of concatenated fingerprints
   const fingerprintsConcat = generations.map(g => g.fingerprint).sort().join('');

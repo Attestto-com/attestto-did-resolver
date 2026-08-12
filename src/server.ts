@@ -18,19 +18,36 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { TrustRegistry } from './registry.js'
 import { DidPkiResolver } from './pki-resolver.js'
 import { DidSnsResolver } from './sns-resolver.js'
 import { CrlRevocationService } from './crl-revocation.js'
 import { RefreshManager, type TrustState } from './trust-refresh.js'
 import { checkBearer } from './admin-auth.js'
-import { readBodyCapped } from './http-utils.js'
+import { readBodyCapped, clientIp } from './http-utils.js'
+import { RateLimiter, DEFAULT_RATE_LIMIT } from './rate-limit.js'
+import { loadAllowedOrigins, corsHeadersFor } from './cors.js'
+import { statusForResolution, resolutionError } from './resolution.js'
+import { parseDidUrl } from './parser.js'
+import { healthReport } from './health.js'
 
 const PORT = Number(process.env.PORT || 8080)
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info'
 const TRUST_STORE = process.env.TRUST_STORE_PATH ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'trust-store', 'countries')
 const REFRESH_SECRET = process.env.REFRESH_SECRET
+
+// ── Rate limiting ───────────────────────────────────────────────────
+// Per-client-IP throttle for the public, unauthenticated surface. Defaults to
+// 1 request per 5s per IP; /health and / (status) are exempt (see handleRequest).
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || DEFAULT_RATE_LIMIT.maxRequests)
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || DEFAULT_RATE_LIMIT.windowMs)
+const rateLimiter = new RateLimiter({ windowMs: RATE_LIMIT_WINDOW_MS, maxRequests: RATE_LIMIT_MAX })
+
+// `X-Forwarded-For` is caller-controlled. Behind Fly the edge sets
+// `Fly-Client-IP`, which is preferred anyway, so this stays off unless a
+// deployment knows a trusted proxy overwrites the header.
+const TRUST_FORWARDED_FOR = process.env.TRUST_FORWARDED_FOR === 'true'
 
 // ── Initialize resolvers ────────────────────────────────────────────
 
@@ -66,24 +83,30 @@ log('info', `[did:sns] Solana RPC: ${process.env.SOLANA_RPC_URL || 'mainnet publ
 // ── CORS ────────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-let allowedOrigins: string[] = []
-try {
-  const raw = readFileSync(join(__dirname, 'cors-whitelist.json'), 'utf-8')
-  allowedOrigins = JSON.parse(raw).allowedOrigins || []
-} catch {
-  allowedOrigins = process.env.NODE_ENV === 'production' ? [] : ['*']
-}
+
+/**
+ * Loaded at boot, and NOT wrapped in a try/catch.
+ *
+ * The previous version fell back to `NODE_ENV === 'production' ? [] : ['*']` on
+ * any read failure — and since `tsc` emits no `.json`, the Dockerfile copied
+ * only `dist/`, and `NODE_ENV` was set nowhere, every built image ran with
+ * `['*']` and reflected any Origin. The allowlist described a control that had
+ * never executed.
+ *
+ * A throw here stops the process. That is the intended behaviour: a resolver
+ * that cannot load its origin policy must not serve traffic pretending it has
+ * one.
+ */
+const allowedOrigins = loadAllowedOrigins(() =>
+  readFileSync(join(__dirname, 'cors-whitelist.json'), 'utf-8'),
+)
+log('info', `CORS: ${allowedOrigins.length} allowed origins`)
 
 function setCorsHeaders(req: IncomingMessage, res: ServerResponse): boolean {
-  const origin = req.headers.origin || ''
-  if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept')
-    res.setHeader('Access-Control-Max-Age', '86400')
-    return true
-  }
-  return false
+  const headers = corsHeadersFor(req.headers.origin, allowedOrigins)
+  if (!headers) return false
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value)
+  return true
 }
 
 // ── Logging ─────────────────────────────────────────────────────────
@@ -132,10 +155,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     return
   }
 
-  // Health check
+  // Health check.
+  //
+  // The verdict is DERIVED from trust state (see health.ts), not asserted. This
+  // used to return a hardcoded `status: 'ok'` alongside the very fields that
+  // showed it was not — so every uptime monitor pointed here reported green
+  // while the instance served baked trust data that had never refreshed.
   if (url.pathname === '/health' || url.pathname === '/') {
-    sendJson(res, 200, {
-      status: 'ok',
+    const health = healthReport(state.meta, Date.now(), REFRESH_INTERVAL_MS)
+    sendJson(res, health.httpStatus, {
+      status: health.status,
+      reasons: health.reasons,
       driver: 'attestto-did-resolver',
       version: '0.1.0',
       supportedMethods: ['pki', 'sns'],
@@ -146,6 +176,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         didCount: state.meta.didCount,
         lastRefreshAt: state.meta.lastRefreshAt,
       },
+    })
+    return
+  }
+
+  // Rate limit — per client IP, 1 req / 5s by default. /health and / returned
+  // above and are exempt so uptime checks and Fly health probes are never throttled.
+  const ip = clientIp(req, { trustForwardedFor: TRUST_FORWARDED_FOR })
+  const limit = rateLimiter.check(ip)
+  if (!limit.allowed) {
+    log('warn', 'Rate limited', { ip, path: url.pathname, retryAfterSec: limit.retryAfterSec })
+    res.setHeader('Retry-After', String(limit.retryAfterSec))
+    sendPlainJson(res, 429, {
+      error: 'rateLimited',
+      message: `Too many requests. Retry after ${limit.retryAfterSec}s.`,
+      retryAfterSec: limit.retryAfterSec,
     })
     return
   }
@@ -255,7 +300,28 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
   // DID Resolution endpoint — route by method
   const identifierMatch = url.pathname.match(/^\/1\.0\/identifiers\/(.+)$/)
   if (identifierMatch && method === 'GET') {
-    const did = decodeURIComponent(identifierMatch[1])
+    // A malformed percent-escape throws URIError. Unguarded, it fell through to
+    // the process-wide catch and answered 500 `internalError` for what is a
+    // client typo — and, once the rate limiter refunds on that code, composed
+    // into an unmetered retry loop. `attestto-trust`'s cert pages interpolate a
+    // DID into this URL unencoded, so this is reachable by accident.
+    let rawIdentifier: string
+    try {
+      rawIdentifier = decodeURIComponent(identifierMatch[1])
+    } catch {
+      sendJson(res, 400, resolutionError('invalidDid', 'Malformed percent-encoding in identifier'))
+      return
+    }
+
+    // Accept a DID URL, not only a bare DID. `did:pki:cr:sinpe:persona-fisica#key-1`
+    // is the shape of a `kid` read straight out of a JWS header — the most
+    // natural thing a consumer holds — and used to come back invalidDid.
+    const didUrl = parseDidUrl(rawIdentifier)
+    if (!didUrl) {
+      sendJson(res, 400, resolutionError('invalidDid', `Not a DID: ${rawIdentifier}`))
+      return
+    }
+    const did = didUrl.did
 
     log('info', 'Resolving DID', { did })
     const startTime = Date.now()
@@ -281,9 +347,26 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
     const duration = Date.now() - startTime
     const hasError = result.didResolutionMetadata?.error
-    const status = hasError
-      ? (hasError === 'notFound' ? 404 : hasError === 'invalidDid' ? 400 : 500)
-      : 200
+
+    // A transient failure (cert couldn't be parsed, upstream RPC hiccup) surfaces
+    // as `internalError`. Unlike notFound/invalidDid — which are the caller's
+    // fault and permanent — this is worth an immediate retry. Mirror the way
+    // transient TLS/SSL errors are retried: hand back the rate-limit token so the
+    // retry isn't throttled, keep the W3C resolution shape (200, null document),
+    // flag it retriable, and tell the caller to retry now (Retry-After: 0).
+    // A transient upstream failure is worth an immediate retry, so the caller
+    // gets its rate-limit token back and a `Retry-After: 0`. But the STATUS
+    // must still say failure: this used to answer 200, and every DIF consumer
+    // here gates on `res.ok`, so a dead RPC read as a successful resolution of
+    // a null document.
+    if (hasError === 'internalError') {
+      rateLimiter.refund(ip)
+      log('warn', 'Resolution transient error — inviting immediate retry', { did, duration, ip })
+      result.didResolutionMetadata = { ...result.didResolutionMetadata, retriable: true }
+      res.setHeader('Retry-After', '0')
+    }
+
+    const status = statusForResolution(hasError)
 
     log(
       hasError ? 'warn' : 'info',
@@ -306,7 +389,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
 // ── Server ──────────────────────────────────────────────────────────
 
-const server = createServer(async (req, res) => {
+/**
+ * The request handler, exported so it can be tested.
+ *
+ * Every route in this file was previously unreachable from a test: the module
+ * exported nothing, called `server.listen()` at import, and fired a network
+ * refresh on the same tick. So the modules underneath were well covered while
+ * the WIRING — whether CORS headers are actually attached, whether the limiter
+ * actually runs before the resolve path, whether a degraded health check
+ * actually sends 503 — was asserted nowhere. That is the layer the defects in
+ * this epic lived in: `cors-whitelist.json` was never copied into the image,
+ * and no unit test could have noticed.
+ */
+export const requestHandler = async (req: IncomingMessage, res: ServerResponse) => {
   try {
     await handleRequest(req, res)
   } catch (error) {
@@ -319,23 +414,45 @@ const server = createServer(async (req, res) => {
       didDocumentMetadata: {},
     })
   }
-})
+}
 
-server.listen(PORT, () => {
-  log('info', `Attestto DID Resolver listening on port ${PORT}`, {
-    methods: ['did:pki', 'did:sns'],
-    pkiDids: state.meta.didCount,
+/**
+ * Bind the port and start the refresh timers.
+ *
+ * Split from module scope so importing this file has no side effects. It used
+ * to `listen()` and fire a network refresh on import, which is why nothing
+ * could import it — and therefore why no route was ever tested.
+ */
+export function start() {
+  const server = createServer(requestHandler)
+
+  server.listen(PORT, () => {
+    log('info', `Attestto DID Resolver listening on port ${PORT}`, {
+      methods: ['did:pki', 'did:sns'],
+      pkiDids: state.meta.didCount,
+    })
   })
-})
 
-// Pull the latest published trust data shortly after boot (non-blocking), then
-// on a fixed interval. Failures are logged and leave the baked snapshot in place.
-refreshManager.refresh('npm', 'startup')
-  .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Startup refresh: ${r.reason}`, { didCount: r.didCount }))
-  .catch((err) => log('warn', `[did:pki] Startup refresh threw: ${err instanceof Error ? err.message : err}`))
+  // Pull the latest published trust data shortly after boot (non-blocking), then
+  // on a fixed interval. Failures are logged and leave the baked snapshot in place.
+  refreshManager.refresh('npm', 'startup')
+    .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Startup refresh: ${r.reason}`, { didCount: r.didCount }))
+    .catch((err) => log('warn', `[did:pki] Startup refresh threw: ${err instanceof Error ? err.message : err}`))
 
-setInterval(() => {
-  refreshManager.refresh('npm', 'scheduled')
-    .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Scheduled refresh: ${r.reason}`, { didCount: r.didCount }))
-    .catch((err) => log('warn', `[did:pki] Scheduled refresh threw: ${err instanceof Error ? err.message : err}`))
-}, REFRESH_INTERVAL_MS).unref()
+  setInterval(() => {
+    refreshManager.refresh('npm', 'scheduled')
+      .then((r) => log(r.ok ? 'info' : 'warn', `[did:pki] Scheduled refresh: ${r.reason}`, { didCount: r.didCount }))
+      .catch((err) => log('warn', `[did:pki] Scheduled refresh threw: ${err instanceof Error ? err.message : err}`))
+  }, REFRESH_INTERVAL_MS).unref()
+
+  // Periodically drop expired rate-limit windows so the map stays bounded.
+  setInterval(() => rateLimiter.prune(), Math.max(RATE_LIMIT_WINDOW_MS, 60_000)).unref()
+
+  return server
+}
+
+// Start only when run as the entrypoint — `node dist/server.js` (the Dockerfile
+// CMD) and `tsx src/server.ts` both satisfy this; an `import` does not.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  start()
+}
