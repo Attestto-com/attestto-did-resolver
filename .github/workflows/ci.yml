@@ -69,9 +69,14 @@ jobs:
           # written `^ *\*`, which could never match: these lines are grep -n
           # output, so they start `path:lineno:` and the content begins after
           # the second colon — never at column 0. The rule had no effect from
-          # the day it was written; it went unnoticed until a comment on the
-          # SNS stack needed it. Anchored on the prefix, it now works, and a
+          # the day it was written, and the first comment to exercise it (a
+          # `sns-parse.ts` note recording what SOC-177 has not decided yet)
+          # failed the build. Anchored on the prefix, it now works, and a
           # planted `const CANARY = 'not implemented yet'` is still caught.
+          #
+          # That comment stays in the tree deliberately: it is the fixture. If
+          # this rule breaks again, the guard reddens on a real file rather
+          # than passing over an allowance nobody exercises.
           ALLOW='stub-guard-ignore\|/i18n/\|/locales/\|@example\|/\*\*\|^[^:]*:[0-9][0-9]*: *\*'
           HITS=0
           for pat in "${PATTERNS[@]}"; do

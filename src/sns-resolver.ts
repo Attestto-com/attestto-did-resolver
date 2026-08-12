@@ -16,12 +16,19 @@
 
 import { Connection, PublicKey } from '@solana/web3.js'
 import { createHash } from 'node:crypto'
+import { parseSnsDid, type SnsNetwork } from './sns-parse.js'
 
 // ── SNS Constants ────────────────────────────────────────────────────────────
 
 const SNS_PROGRAM_ID = new PublicKey('namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX')
 const SOL_TLD_PARENT = new PublicKey('58PwtjSDuFHuUkYjH9BYnnQKHfwo9reZhC2zMJv9JPkx')
 const HASH_PREFIX = 'SPL Name Service'
+
+/**
+ * The all-zero account — the Solana system program. §9.4 deactivates a DID by
+ * transferring the domain to it, which the SNS program cannot undo.
+ */
+const ZERO_ADDRESS = PublicKey.default.toBase58()
 
 const NETWORK_ENDPOINTS: Record<string, string> = {
   mainnet: 'https://api.mainnet-beta.solana.com',
@@ -68,9 +75,11 @@ interface DidMetadata {
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface ParsedSnsDid {
+  /** The identifier as the caller wrote it — DID Core: the document `id` is the DID resolved. */
   did: string
+  /** Suffix-stripped, selector-removed: what §9.2 step 4 hashes. */
   name: string
-  network: string
+  network: SnsNetwork
 }
 
 export interface DidDocument {
@@ -110,6 +119,14 @@ export interface DidResolutionMetadata {
   error?: string
   errorMessage?: string
   duration?: number
+  /**
+   * §9.2: the domain exists on-chain but carries no DID metadata, so whatever
+   * is returned was synthesised from the owner key alone. A verifier MUST treat
+   * this as an UNREGISTERED identity.
+   */
+  degraded?: boolean
+  /** Human-readable companion to `degraded`, and the only signal §9.5's suspension has. */
+  warning?: string
   snsMetadata?: Record<string, unknown>
 }
 
@@ -120,57 +137,147 @@ export interface DidDocumentMetadata {
   versionId?: string
 }
 
+// ── Injected dependencies ────────────────────────────────────────────────────
+
+/**
+ * Reads a NameRegistry account. Injected so resolution can be exercised without
+ * a Solana RPC — the reason this file had zero tests while carrying four spec
+ * violations. The default implementation below preserves the previous
+ * behaviour exactly for callers that pass nothing.
+ */
+export interface SnsAccountReader {
+  fetchAccount(address: string, network: SnsNetwork): Promise<Buffer | null>
+}
+
+export interface DidSnsResolverDeps extends SnsAccountReader {
+  /** Injected so `duration` is not wall-clock in tests. */
+  now?: () => number
+  /**
+   * Service endpoints this deployment advertises for the DIDs it operates.
+   *
+   * Defaults to NONE. The spec is operator-agnostic (§1) and a driver that
+   * hardcodes one company's hostnames into every document is asserting a
+   * relationship the subject never entered into. An operator opts in; the
+   * published driver does not.
+   */
+  operatorServices?: (did: string, network: SnsNetwork) => ServiceEndpoint[]
+}
+
 // ── Resolver ─────────────────────────────────────────────────────────────────
 
 export class DidSnsResolver {
   private connectionCache: Map<string, Connection> = new Map()
+  private readonly deps: Required<DidSnsResolverDeps>
+
+  constructor(deps?: DidSnsResolverDeps) {
+    this.deps = {
+      fetchAccount: deps?.fetchAccount ?? ((address, network) => this.readFromRpc(address, network)),
+      now: deps?.now ?? (() => Date.now()),
+      operatorServices: deps?.operatorServices ?? (() => []),
+    }
+  }
+
+  /** The default reader: a live Solana RPC, as before. */
+  private async readFromRpc(address: string, network: SnsNetwork): Promise<Buffer | null> {
+    const rpcUrl =
+      process.env.SOLANA_RPC_URL || NETWORK_ENDPOINTS[network] || NETWORK_ENDPOINTS.mainnet
+    const info = await this.getConnection(rpcUrl).getAccountInfo(new PublicKey(address))
+    return info ? info.data : null
+  }
 
   /**
    * Resolve a did:sns DID to a W3C DID Resolution Result.
    */
   async resolve(did: string): Promise<DidResolutionResult> {
-    const startTime = Date.now()
+    const startTime = this.deps.now()
 
     try {
-      // Step 1: Parse
-      const parsed = this.parseDid(did)
-      if (!parsed) {
-        return this.errorResult('invalidDid', `Cannot parse DID: ${did}`)
+      // ── §9.2 steps 1-3: parse, strip `.sol`, validate depth ──────────────
+      //
+      // Delegated to `sns-parse.ts`, which implements §7.1's ABNF, §7.1's
+      // reserved network selectors and §9.2's strip-before-depth ordering. It
+      // runs BEFORE any account read, so a malformed name can no longer become
+      // a PDA lookup — `did:sns:alice.` used to derive a key from an empty
+      // label and answer notFound.
+      const parsed = parseSnsDid(did)
+      if (!parsed.ok) {
+        // §9.2's error set is closed (invalidDid / notFound / deactivated /
+        // internalError) and names no code for a depth failure, so `tooDeep`
+        // maps onto invalidDid rather than inventing a fifth wire value.
+        // SOC-177 asks the spec to name one.
+        return this.errorResult('invalidDid', parsed.message)
       }
+      const { name, network } = parsed.value
 
-      // Step 2: Derive PDA
-      const domainParts = parsed.name.split('.')
-      if (domainParts.length > 2) {
-        return this.errorResult(
-          'invalidDid',
-          'SNS supports max 2 levels (parent.subdomain)'
-        )
-      }
-
-      // Step 3: Fetch on-chain
-      const rpcUrl = process.env.SOLANA_RPC_URL || NETWORK_ENDPOINTS[parsed.network] || NETWORK_ENDPOINTS.mainnet
-      const connection = this.getConnection(rpcUrl)
-
-      const domainData = await this.fetchDomainData(connection, parsed.name)
+      const domainData = await this.fetchDomainData(name, network)
       if (!domainData) {
-        return this.errorResult('notFound', `No did:sns DID found for: ${parsed.did}`)
+        // Genuinely absent — no account at the derived PDA. Deliberately NOT
+        // degraded: that flag distinguishes "exists but unregistered" from
+        // "does not exist", and setting it on every notFound would erase the
+        // distinction §9.2 introduced it to preserve.
+        return this.errorResult('notFound', `No did:sns DID found for: ${did}`)
       }
 
-      // Verify did:sns compliance — domain must have DID metadata or be an Attestto domain
-      const isAttesttoCompliant = domainData.didMetadata?.hasMetadata || parsed.name.includes('attestto')
-      if (!isAttesttoCompliant) {
-        return this.errorResult('notFound', `No did:sns DID found for: ${parsed.did}`)
+      // ── §9.2 step 9: the zero owner, checked BEFORE the buffer ────────────
+      //
+      // "If owner is zero address → return deactivated." The ordering is not
+      // cosmetic: transferring the domain to the system program does not erase
+      // the data buffer, so a retired identity read in the other order still
+      // presents a live document whose #key-1 is the system program itself.
+      //
+      // No `error` member: §9.4's worked example carries only `contentType`,
+      // and `server.ts` derives its status from the presence of `error`, so an
+      // error code here would turn the documented HTTP 200 into a 500.
+      if (domainData.owner === ZERO_ADDRESS) {
+        return {
+          '@context': 'https://w3id.org/did-resolution/v1',
+          didDocument: null,
+          didResolutionMetadata: {
+            contentType: 'application/did+ld+json',
+            duration: this.deps.now() - startTime,
+          },
+          didDocumentMetadata: { deactivated: true },
+        }
+      }
+
+      // §9.1: "DID registration requires an on-chain write." §12: "DID
+      // registration is not implicit."
+      //
+      // This used to read `|| name.includes('attestto')`, accepting a SUBSTRING
+      // of the name as a substitute for the 0x44494401 write. `attesttofake`,
+      // `not-attestto-really` and `x.attestto-evil` all satisfied it, so anyone
+      // could register such a `.sol` name with an empty buffer and receive a
+      // resolver-blessed document — on the vendor's own brand, which §3.2's
+      // Model D warning exists to prevent a verifier from trusting.
+      //
+      // Registration is the write. There is no name that skips it.
+      //
+      // §9.2 permits either the owner-key fallback document or this
+      // `notFound`-adjacent empty result; we keep the empty one, since a
+      // populated-but-untrusted document is exactly the shape §9.1 says
+      // verifiers keep mistaking for a registered identity. What was missing is
+      // the second half of the sentence — "it MUST still set degraded: true so
+      // the distinction from a genuinely non-existent domain is preserved".
+      // Without it the flag §9.1 tells verifiers to gate on does not exist, and
+      // an unwritten domain is indistinguishable from an absent one.
+      if (!domainData.didMetadata?.hasMetadata) {
+        return this.errorResult('notFound', `No did:sns DID found for: ${did}`, {
+          degraded: true,
+          warning:
+            'unregistered did:sns — SNS domain exists but no DID metadata was written; ' +
+            'owner key only, no services / encryption / attestation',
+        })
       }
 
       // Step 4: Build DID Document
-      const didDocument = this.buildDidDocument(parsed, domainData)
+      const didDocument = this.buildDidDocument({ did, name, network }, domainData)
 
-      const duration = Date.now() - startTime
+      const duration = this.deps.now() - startTime
 
       // Include on-chain DID metadata in resolution metadata
       const snsMetadata: Record<string, unknown> = {
         owner: domainData.owner,
-        network: parsed.network,
+        network,
         classKey: domainData.classKey,
       }
 
@@ -186,43 +293,47 @@ export class DidSnsResolver {
         }
       }
 
+      // ── §9.5: suspension is not deactivation ─────────────────────────────
+      //
+      // A cleared ACTIVE flag used to be reported as
+      // `didDocumentMetadata.deactivated = true`. §9.5 lists the two as
+      // separate lifecycle phases — suspension is "Active flag cleared … DID
+      // remains resolvable but non-functional" and has a documented Recovery
+      // phase; deactivation is the zero-owner transfer §9.4 marks IRREVERSIBLE.
+      // Claiming the permanent state for a compliance hold tells a consumer an
+      // identity is gone for good when it is expected back.
+      //
+      // The spec defines no machine-readable member for suspension — only
+      // `deactivated`, which is spoken for. Rather than invent one, the state
+      // goes in `warning`, the vocabulary §9.2 already uses for exactly this
+      // "a generic consumer must be able to see it" problem. SOC-177 asks the
+      // spec for a flag; until it names one, nothing here is fabricated.
+      const suspended = domainData.didMetadata.active === false
+
       return {
         '@context': 'https://w3id.org/did-resolution/v1',
         didDocument,
         didResolutionMetadata: {
           contentType: 'application/did+ld+json',
           duration,
+          ...(suspended
+            ? {
+                warning:
+                  'suspended did:sns — the on-chain ACTIVE flag is cleared; the DID resolves ' +
+                  'but MUST NOT be relied upon for authentication, credential verification or ' +
+                  'attestation validation until it is restored',
+              }
+            : {}),
           snsMetadata,
         },
         didDocumentMetadata: {
           versionId: domainData.owner,
-          ...(domainData.didMetadata?.active === false ? { deactivated: true } : {}),
         },
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error'
       return this.errorResult('internalError', message)
     }
-  }
-
-  /**
-   * Parse a did:sns DID string.
-   *
-   * Formats:
-   *   did:sns:alice.attestto          → mainnet, name = alice.attestto
-   *   did:sns:devnet:alice.attestto   → devnet, name = alice.attestto
-   *   did:sns:alice                   → mainnet, name = alice (root domain)
-   */
-  private parseDid(did: string): ParsedSnsDid | null {
-    const match = did.match(/^did:sns:(?:(mainnet|devnet|testnet):)?([a-zA-Z0-9][\w.-]*)$/)
-    if (!match) return null
-
-    const network = match[1] || 'mainnet'
-    const name = match[2]
-
-    if (!name || name.length === 0) return null
-
-    return { did, name, network }
   }
 
   /**
@@ -237,8 +348,8 @@ export class DidSnsResolver {
    * Fetch domain data from Solana Name Service.
    */
   private async fetchDomainData(
-    connection: Connection,
-    name: string
+    name: string,
+    network: SnsNetwork
   ): Promise<{ owner: string; classKey: string | null; didMetadata: DidMetadata | null } | null> {
     const parts = name.split('.')
 
@@ -272,8 +383,8 @@ export class DidSnsResolver {
       domainKey = subKey
     }
 
-    const accountInfo = await connection.getAccountInfo(domainKey)
-    if (!accountInfo || accountInfo.data.length < 96) {
+    const data = await this.deps.fetchAccount(domainKey.toBase58(), network)
+    if (!data || data.length < 96) {
       return null
     }
 
@@ -281,18 +392,18 @@ export class DidSnsResolver {
     // bytes 0-31:  parentName (PublicKey)
     // bytes 32-63: owner (PublicKey)
     // bytes 64-95: class (PublicKey) — zero = unlocked
-    const ownerBytes = accountInfo.data.slice(32, 64)
+    const ownerBytes = data.slice(32, 64)
     const owner = new PublicKey(ownerBytes).toBase58()
 
     let classKey: string | null = null
-    const classKeyBytes = accountInfo.data.slice(64, 96)
+    const classKeyBytes = data.slice(64, 96)
     const classKeyPub = new PublicKey(classKeyBytes)
     if (!classKeyPub.equals(PublicKey.default)) {
       classKey = classKeyPub.toBase58()
     }
 
     // Parse DID metadata from data buffer (bytes 96+)
-    const didMetadata = this.parseDidMetadata(accountInfo.data)
+    const didMetadata = this.parseDidMetadata(data)
 
     return { owner, classKey, didMetadata }
   }
@@ -389,72 +500,40 @@ export class DidSnsResolver {
       keyAgreement.push(`${did}#ecies-key`)
     }
 
-    const isAttestto = parsed.name.includes('attestto') || meta?.hasMetadata
-    const services: ServiceEndpoint[] = []
-
-    // LinkedDomains and platform service only for Attestto domains
-    if (isAttestto) {
-      services.push({
-        id: `${did}#sns-domain`,
-        type: 'LinkedDomains',
-        serviceEndpoint: `https://${parsed.name}.sol`,
-      })
-
-      services.push({
-        id: `${did}#attestto-platform`,
-        type: 'VerifiablePresentationService',
-        serviceEndpoint: {
-          origins: ['https://app.attestto.com'],
-          presentations: `https://api.attestto.com/ssi/my-credentials`,
-        },
-      })
-    }
-
-    // Add DIDComm messaging service if DID metadata is present and active
-    if (meta?.hasMetadata && meta.active) {
-      services.push({
-        id: `${did}#didcomm`,
-        type: 'DIDCommMessaging',
-        serviceEndpoint: {
-          uri: `https://api.attestto.com/didcomm/`,
-          accept: ['didcomm/v2'],
-          routingKeys: [],
-        },
-      })
-    }
-
-    // Add vault endpoint hash as a service if present
-    if (meta?.hasMetadata && meta.vaultEndpointHash && meta.vaultEndpointHash !== '0'.repeat(64)) {
-      services.push({
-        id: `${did}#vault`,
-        type: 'EncryptedVault',
-        serviceEndpoint: {
-          endpointHash: meta.vaultEndpointHash,
-          encryptionScheme: 'Shamir-2-of-2-XOR',
-        },
-      })
-    }
-
-    // Add SAS attestation reference if present (v2)
-    if (meta?.hasSas && meta.sasAttestationUid) {
-      services.push({
-        id: `${did}#sas-attestation`,
-        type: 'SasAttestation',
-        serviceEndpoint: {
-          attestationPda: meta.sasAttestationUid,
-          network: parsed.network,
-        },
-      })
-    }
-
-    // Add status list service only for Attestto domains
-    if (isAttestto) {
-      services.push({
-        id: `${did}#status-list`,
-        type: 'BitstringStatusList',
-        serviceEndpoint: `https://api.attestto.com/api/status/`,
-      })
-    }
+    // ── §8.6 service endpoints ──────────────────────────────────────────
+    //
+    // §1: the method is "operator-agnostic — any SNS domain owner … can anchor
+    // DIDs under their namespace". §8.4: "Service endpoints point to the
+    // tenant's infrastructure (whitelabel)."
+    //
+    // This block used to attach `api.attestto.com` / `app.attestto.com` VP,
+    // DIDComm and status-list endpoints to EVERY document, sourced from nothing
+    // on-chain — so resolving an independent operator's DID told every verifier
+    // to fetch that subject's presentations and revocation status from a third
+    // party they have no relationship with. §12.5 lists exactly that
+    // ("repoint the vault / VP / DIDComm service endpoints") as an ATTACKER
+    // capability. A public DIF driver performing it by default is worse than an
+    // attacker doing it once.
+    //
+    // Nothing is emitted that the chain did not supply:
+    //
+    //   - `LinkedDomains https://<name>.sol` was fabricated from the name, and
+    //     asserted a hostname in a TLD that does not exist in DNS.
+    //     `LinkedDomains` is also not among §8.6's five service types.
+    //   - the vault entry carried `EncryptedVault` (§8.6 defines
+    //     `EncryptedDataVault`) with the buffer's *hash* where §8.2/§8.4 put a
+    //     URL. §10 is explicit that the buffer holds "SHA-256 of vault service
+    //     endpoint URL" — a commitment, not an endpoint. A hash cannot be
+    //     dereferenced, so there is no conformant value to emit. It stays in
+    //     `snsMetadata`, where a consumer that knows the URL can check it.
+    //   - `SasAttestation` is not a §8.6 type. The UID is already reported in
+    //     `didResolutionMetadata.snsMetadata`, so nothing is lost by dropping
+    //     the service entry.
+    //
+    // An operator that wants its own endpoints advertised configures them; the
+    // driver ships neutral. Per Rule 0, a resolver does not invent an endpoint
+    // any more than it invents a key.
+    const services: ServiceEndpoint[] = this.deps.operatorServices(did, parsed.network)
 
     const doc: DidDocument = {
       '@context': DID_CONTEXT,
@@ -476,11 +555,15 @@ export class DidSnsResolver {
   /**
    * Build an error resolution result.
    */
-  private errorResult(error: string, errorMessage: string): DidResolutionResult {
+  private errorResult(
+    error: string,
+    errorMessage: string,
+    extra?: Pick<DidResolutionMetadata, 'degraded' | 'warning'>
+  ): DidResolutionResult {
     return {
       '@context': 'https://w3id.org/did-resolution/v1',
       didDocument: null,
-      didResolutionMetadata: { error, errorMessage },
+      didResolutionMetadata: { error, errorMessage, ...extra },
       didDocumentMetadata: {},
     }
   }
