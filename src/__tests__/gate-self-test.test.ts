@@ -77,6 +77,53 @@ describe('the tree carries no path out of this repository', () => {
   })
 })
 
+describe('the gates are proven able to fail', () => {
+  // `scripts/gate-self-test.mjs` seeds a real violation against each gate and
+  // requires a non-zero exit, then removes it and requires zero. It asserts
+  // its own presence in ci.yml — but only if it runs, and deleting the step is
+  // exactly how it stops running. So the step is asserted from here too, in
+  // the one suite that keeps running after it is gone.
+  test('ci.yml runs the gate self-test', () => {
+    assert.match(
+      ci,
+      /^\s*run:\s*npm run gate-self-test\s*$/m,
+      'ci.yml no longer proves its gates can fail — a gate that cannot fail is decorative',
+    )
+  })
+
+  test('it runs before the gates it vouches for', () => {
+    // A gate proven broken after it has already passed teaches nothing. The
+    // cheapest step first, so the rest of the run is readable.
+    const selfTestAt = ci.search(/^\s*run:\s*npm run gate-self-test\s*$/m)
+    const testAt = ci.search(/^\s*run:\s*npm test\s*$/m)
+    assert.ok(selfTestAt > 0 && testAt > 0, 'both steps must exist')
+    assert.ok(selfTestAt < testAt, 'the gate self-test must run before the gates it checks')
+  })
+
+  test('every registered gate names a script that exists', () => {
+    // A gate pointing at a deleted script is not a gate. The script would
+    // catch this itself via `npm run <missing>` exiting non-zero on the SEEDED
+    // run — which looks like success. This distinguishes the two.
+    const config = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8')) as {
+      gateSelfTest?: { gates?: Array<{ script: string; seed: string; content: string }> }
+    }
+    const gates = config.gateSelfTest?.gates ?? []
+    assert.ok(gates.length > 0, 'no gate is registered, so the self-test proves nothing')
+    for (const gate of gates) {
+      assert.ok(pkg.scripts[gate.script], `gateSelfTest names \`${gate.script}\`, which is not a script`)
+      assert.ok(gate.seed && gate.content, `gate \`${gate.script}\` has no seeded violation`)
+    }
+  })
+
+  test('no seed file was left behind by a crashed run', () => {
+    // The seeds violate their gate by construction. One surviving in the tree
+    // reddens every later run for a reason that looks like a real defect.
+    const out = execFileSync('git', ['ls-files'], { cwd: repoRoot, encoding: 'utf-8' })
+    const stray = out.split('\n').filter(f => f.includes('gate-self-test-seed'))
+    assert.deepEqual(stray, [], `seeded violation(s) committed: ${stray.join(', ')}`)
+  })
+})
+
 describe('CI actually runs the tests', () => {
   test('ci.yml has a step that runs `npm test`', () => {
     // Matches `run: npm test` on its own line — not `npm test:coverage`, and

@@ -51,6 +51,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Every step below is a control, and on 2026-08-11 an audit of eight
+      # Attestto repos found that EVERY blocker was a control that existed and
+      # had never executed — none were missing, all were decorative. This repo
+      # was one of them: nine suites, zero runs, seven spec violations on a
+      # public endpoint under a green check.
+      #
+      # So the gates get asked to prove they can still go red. This step seeds
+      # a failing spec and requires `npm test` to exit non-zero, seeds a type
+      # error and requires `npm run build` to exit non-zero, then deletes both
+      # and requires green — a gate that fails on everything is as useless as
+      # one that passes on everything. It also reads THIS file and asserts the
+      # wiring no dynamic check can see: `branches: ['**']`, no
+      # `continue-on-error`, no swallowed exit codes, an install command
+      # matching the lockfile that is actually here, tests before build, and
+      # the tests being type-checked separately since tsconfig.json excludes
+      # them.
+      #
+      # It runs first because a gate that cannot fail makes every result after
+      # it unreadable. scripts/gate-self-test.mjs is byte-identical across
+      # Attestto repos and must not be edited here; per-repo knowledge lives
+      # in package.json#gateSelfTest.
+      - name: Gate self-test
+        run: npm run gate-self-test
+
       - name: Stub guard
         run: |
           PATTERNS=(
