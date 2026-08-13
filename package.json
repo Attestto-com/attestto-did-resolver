@@ -11,7 +11,27 @@
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "test": "node --import tsx --test 'src/**/*.test.ts'",
-    "test:coverage": "c8 npm test"
+    "test:coverage": "c8 npm test",
+    "gate-self-test": "node scripts/gate-self-test.mjs"
+  },
+  "gateSelfTest": {
+    "workflow": ".github/workflows/ci.yml",
+    "testScript": "test",
+    "buildScript": "build",
+    "gates": [
+      {
+        "name": "test",
+        "script": "test",
+        "seed": "src/__tests__/gate-self-test-seed.test.ts",
+        "content": "// Written and deleted inside one `npm run gate-self-test` run. If you are\n// reading this in a committed tree, a run crashed between the two.\nimport { test } from 'node:test'\nimport assert from 'node:assert/strict'\n\ntest('seeded violation: a failing spec must fail `npm test`', () => {\n  assert.equal('gate', 'seeded violation')\n})\n"
+      },
+      {
+        "name": "build",
+        "script": "build",
+        "seed": "src/gate-self-test-seed.ts",
+        "content": "// Written and deleted inside one `npm run gate-self-test` run. If you are\n// reading this in a committed tree, a run crashed between the two.\nexport const seededTypeError: number = 'this is not a number'\n"
+      }
+    ]
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
